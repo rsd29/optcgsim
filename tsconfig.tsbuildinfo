@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/client/createlocalgameclient.ts","./src/client/gameclient.ts","./src/engine/enginesocketserver.ts","./src/engine/gameengineserver.ts","./src/game/mockcardpool.ts","./src/game/protocol.ts","./src/game/snapshot.ts","./src/game/types.ts","./src/network/localwebsocket.ts"],"version":"5.9.3"}
