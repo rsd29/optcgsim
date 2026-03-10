@@ -219,6 +219,7 @@ function App() {
 
   const canStartAttack = (() => {
     if (!snapshot || !selected || !inMainPhase) return false;
+    if (pendingAttack) return false;
     if (selected.playerId !== activePlayerId) return false;
     if (selected.kind === "LEADER") {
       const player = getPlayer(selected.playerId);
@@ -302,12 +303,6 @@ function App() {
 
     return (
       <section className={`field-zone ${isActive ? "field-zone-active" : ""} ${isOpponent ? "field-opponent" : "field-player"}`}>
-        <div className="field-header">
-          <strong>
-            {p.name} ({p.playerId}) {isActive ? "- ACTIVE" : ""}
-          </strong>
-        </div>
-
         <div className="field-row field-row-top">{renderCharacterRow(playerId)}</div>
 
         <div className="field-row field-row-middle">
@@ -353,8 +348,16 @@ function App() {
             </div>
           </div>
           <div className="don-area">
-            <div className="don-chip active">Active DON: {p.donActive}</div>
-            <div className="don-chip rested">Rested DON: {p.donRested}</div>
+            {Array.from({ length: p.donActive }, (_, idx) => (
+              <div key={`${playerId}-don-active-${idx}`} className="card-shell card-back don-card">
+                <div className="don-mark">DON</div>
+              </div>
+            ))}
+            {Array.from({ length: p.donRested }, (_, idx) => (
+              <div key={`${playerId}-don-rested-${idx}`} className="card-shell card-back don-card card-rested">
+                <div className="don-mark">DON</div>
+              </div>
+            ))}
           </div>
           <div className="pile-stack">
             <div className="card-shell card-back pile-card trash-card">

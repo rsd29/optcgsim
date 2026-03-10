@@ -120,7 +120,7 @@ button {
   min-width: 140px;
 }
 
-button:hover {
+button:not(.card-shell):hover {
   background: #223359;
 }
 
@@ -181,29 +181,39 @@ button:hover {
   border-radius: 14px;
   background: radial-gradient(circle at center, #172845 0%, #101b30 100%);
   padding: 12px;
-  overflow-x: auto;
+  overflow: visible;
   display: grid;
   row-gap: 0;
 }
 
 .field-zone {
-  border: 1px solid #3b5070;
+  border: 1px solid #464646;
   border-radius: 12px;
   padding: 5px;
-  background: rgba(12, 24, 44, 0.72);
-  display: grid;
-  row-gap: 6px;
+  background: rgba(20, 20, 20, 0.72);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .field-opponent {
-  transform: rotate(180deg);
-  transform-origin: center center;
+  padding-top: 14px;
 }
 
-.field-opponent .field-header,
-.field-opponent .field-row {
-  transform: rotate(180deg);
-  transform-origin: center center;
+.field-player {
+  padding-bottom: 12px;
+}
+
+.field-opponent .field-row-top {
+  order: 3;
+}
+
+.field-opponent .field-row-middle {
+  order: 2;
+}
+
+.field-opponent .field-row-bottom {
+  order: 1;
 }
 
 .field-opponent .field-row-bottom .pile-stack:first-child {
@@ -347,7 +357,7 @@ button:hover {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: 10px;
 }
 
 .field-row-middle > .center-lane-pair > .leader-card {
@@ -361,27 +371,36 @@ button:hover {
 }
 
 .don-area {
-  display: grid;
-  grid-template-columns: repeat(2, max-content);
-  column-gap: 8px;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  gap: 0;
   align-items: center;
   justify-content: center;
   width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: visible;
 }
 
-.don-chip {
-  border-radius: 8px;
-  border: 1px solid #4f6790;
-  padding: 8px 10px;
-  font-size: 12px;
-  color: #d8e6ff;
-  background: #1b2a45;
-  white-space: nowrap;
-  text-align: center;
+.don-card {
+  flex: 0 0 auto;
+  position: relative;
+  margin: 0;
 }
 
-.don-chip.rested {
-  opacity: 0.65;
+.don-area .don-card + .don-card {
+  margin-left: -22px;
+}
+
+.don-card.card-rested {
+  margin: 0;
+}
+
+.don-mark {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
 }
 
 .card-shell {
@@ -395,6 +414,26 @@ button:hover {
   margin: 0 auto;
 }
 
+button.card-shell {
+  position: relative;
+  scale: 1;
+  transition: filter 180ms ease, scale 180ms ease, box-shadow 180ms ease;
+}
+
+button.card-shell:hover {
+  filter: brightness(1.1);
+  scale: 1.03;
+  z-index: 5;
+}
+
+.card-shell.don-card {
+  width: calc(var(--board-card-width) * 0.80);
+  aspect-ratio: var(--card-ratio);
+  padding: 2px;
+  border-radius: 6px;
+  margin: 0;
+}
+
 .field-card,
 .leader-card {
   text-align: left;
@@ -404,8 +443,13 @@ button:hover {
   border-color: #a8883f;
 }
 
+.leader-card {
+  border-radius: 0;
+  border-color: #7a7a7a;
+}
+
 .card-selected {
-  box-shadow: 0 0 0 2px #6dd3ff inset;
+  box-shadow: 0 0 0 4px #0b2a5a inset;
 }
 
 .card-targetable {
@@ -413,7 +457,7 @@ button:hover {
 }
 
 .card-targeted {
-  box-shadow: 0 0 0 2px #f26d6d inset;
+  box-shadow: 0 0 0 4px #b01616 inset;
 }
 
 .card-rested {
@@ -510,7 +554,7 @@ button:hover {
   justify-content: start;
   gap: 10px;
   width: 100%;
-  overflow-x: auto;
+  overflow: visible;
   padding-bottom: 4px;
 }
 
