@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="420" viewBox="0 0 300 420">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1f2a3d" />
+      <stop offset="100%" stop-color="#101724" />
+    </linearGradient>
+  </defs>
+  <rect width="300" height="420" fill="url(#bg)" />
+  <rect x="18" y="18" width="264" height="384" rx="14" fill="none" stroke="#5c78a8" stroke-width="2" />
+  <text x="150" y="190" fill="#d9e5ff" font-size="22" text-anchor="middle" font-family="Arial, sans-serif">NO ART</text>
+  <text x="150" y="222" fill="#8ea6cf" font-size="14" text-anchor="middle" font-family="Arial, sans-serif">fallback image</text>
+</svg>

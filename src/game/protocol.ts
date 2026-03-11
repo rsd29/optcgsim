@@ -23,6 +23,27 @@ export type ClientRequest =
     }
   | {
       requestId: string;
+      type: "BLOCK_ATTACK";
+      payload: { playerId: PlayerId; blockerRef: number | string };
+    }
+  | {
+      requestId: string;
+      type: "PASS_BLOCK";
+      payload: { playerId: PlayerId };
+    }
+  | {
+      requestId: string;
+      type: "RESOLVE_PROMPT";
+      payload: {
+        playerId: PlayerId;
+        promptId: string;
+        selectedCardInstanceIds?: string[] | undefined;
+        selectedOptionId?: string | undefined;
+        yesNoChoice?: boolean | undefined;
+      };
+    }
+  | {
+      requestId: string;
       type: "END_TURN";
       payload: { playerId: PlayerId };
     }

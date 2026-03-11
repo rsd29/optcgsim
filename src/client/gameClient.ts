@@ -20,6 +20,13 @@ export type GameClientApi = {
   playCharacter: (playerId: PlayerId, handIndex?: number, replaceRef?: number | string) => void;
   attackLeader: (playerId: PlayerId, attackerRef?: "leader" | number | string) => void;
   attackCharacter: (playerId: PlayerId, attackerRef: "leader" | number | string, defenderRef: number | string) => void;
+  blockAttack: (playerId: PlayerId, blockerRef: number | string) => void;
+  passBlock: (playerId: PlayerId) => void;
+  resolvePrompt: (
+    playerId: PlayerId,
+    promptId: string,
+    payload?: { selectedCardInstanceIds?: string[]; selectedOptionId?: string; yesNoChoice?: boolean }
+  ) => void;
   endTurn: (playerId: PlayerId) => void;
   autoMainStep: (playerId: PlayerId) => void;
   autoPlay: (playerId: PlayerId, maxSteps?: number) => void;
@@ -117,6 +124,30 @@ export const createGameClient = (
         payload: { playerId, attackerRef, defenderRef }
       });
     },
+    blockAttack(playerId, blockerRef) {
+      send({
+        type: "BLOCK_ATTACK",
+        payload: { playerId, blockerRef }
+      });
+    },
+    passBlock(playerId) {
+      send({
+        type: "PASS_BLOCK",
+        payload: { playerId }
+      });
+    },
+    resolvePrompt(playerId, promptId, payload) {
+      send({
+        type: "RESOLVE_PROMPT",
+        payload: {
+          playerId,
+          promptId,
+          selectedCardInstanceIds: payload?.selectedCardInstanceIds,
+          selectedOptionId: payload?.selectedOptionId,
+          yesNoChoice: payload?.yesNoChoice
+        }
+      });
+    },
     endTurn(playerId) {
       send({
         type: "END_TURN",
@@ -164,6 +195,9 @@ export const createGameClient = (
       console.log("  OPTCG.playCharacter('P1' | 'P2', handIndex?, replaceRef?)");
       console.log("  OPTCG.attackLeader('P1' | 'P2', attackerRef?)");
       console.log("  OPTCG.attackCharacter('P1' | 'P2', attackerRef, defenderRef)");
+      console.log("  OPTCG.blockAttack('P1' | 'P2', blockerRef)");
+      console.log("  OPTCG.passBlock('P1' | 'P2')");
+      console.log("  OPTCG.resolvePrompt('P1' | 'P2', promptId, payload?)");
       console.log("  OPTCG.endTurn('P1' | 'P2')");
       console.log("  OPTCG.autoMainStep('P1' | 'P2')");
       console.log("  OPTCG.autoPlay('P1' | 'P2', maxSteps?)");

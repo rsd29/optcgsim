@@ -1,4 +1,5 @@
 import type { GameState, PlayerId, ReadableSnapshot } from "./types";
+import { getCardArtUrlForCard, getCardCounter, getCardCost, getCardKeywords, getCardPower } from "./cardCatalog";
 
 export const toReadableSnapshot = (state: GameState): ReadableSnapshot => {
   const active = state.players[state.activePlayerId];
@@ -8,7 +9,8 @@ export const toReadableSnapshot = (state: GameState): ReadableSnapshot => {
       playerId: p.id,
       name: p.name,
       active: state.activePlayerId === p.id,
-      leaderPower: p.leader.power ?? 0,
+      leaderPower: getCardPower(state, p.leader),
+      leaderArtUrl: getCardArtUrlForCard(state, p.leader, "medium"),
       leaderRested: p.leader.rested,
       turnsTaken: p.turnsTaken,
       life: p.life.length,
@@ -27,11 +29,45 @@ export const toReadableSnapshot = (state: GameState): ReadableSnapshot => {
       slot: i,
       id: c.instanceId,
       name: c.name,
-      cost: c.cost,
-      power: c.power,
+      cost: getCardCost(state, c),
+      power: getCardPower(state, c),
+      artUrl: getCardArtUrlForCard(state, c, "medium"),
       rested: c.rested,
-      summoningSick: c.summoningSick ?? false
+      summoningSick: c.summoningSick ?? false,
+      hasBlocker: getCardKeywords(state, c).includes("BLOCKER")
     }));
+
+  const donRows = (id: PlayerId) => {
+    const p = state.players[id];
+    return [
+      ...p.donActive.map((d) => ({ id: d.id, rested: false })),
+      ...p.donRested.map((d) => ({ id: d.id, rested: true }))
+    ];
+  };
+
+  const handRows = (id: PlayerId) =>
+    state.players[id].hand.map((card, i) => ({
+      handIndex: i,
+      id: card.instanceId,
+      name: card.name,
+      type: card.type,
+      cost: getCardCost(state, card),
+      power: getCardPower(state, card),
+      counter: getCardCounter(state, card),
+      artUrl: getCardArtUrlForCard(state, card, "medium"),
+      hasBlocker: getCardKeywords(state, card).includes("BLOCKER")
+    }));
+
+  const trashTop = (id: PlayerId) => {
+    const pile = state.players[id].trash;
+    const card = pile.length > 0 ? pile[pile.length - 1] : null;
+    if (!card) return null;
+    return {
+      id: card.instanceId,
+      name: card.name,
+      artUrl: getCardArtUrlForCard(state, card, "medium")
+    };
+  };
 
   return {
     match: {
@@ -40,7 +76,8 @@ export const toReadableSnapshot = (state: GameState): ReadableSnapshot => {
       turnNumber: state.turnNumber,
       phase: state.phase,
       activePlayerId: state.activePlayerId,
-      firstPlayerId: state.firstPlayerId
+      firstPlayerId: state.firstPlayerId,
+      combatStatus: state.combat.status
     },
     players: [playerSummary("P1"), playerSummary("P2")],
     activeHand: active.hand.map((card, i) => ({
@@ -48,12 +85,26 @@ export const toReadableSnapshot = (state: GameState): ReadableSnapshot => {
       id: card.instanceId,
       name: card.name,
       type: card.type,
-      cost: card.cost,
-      power: card.power
+      cost: getCardCost(state, card),
+      power: getCardPower(state, card),
+      counter: getCardCounter(state, card),
+      artUrl: getCardArtUrlForCard(state, card, "medium"),
+      hasBlocker: getCardKeywords(state, card).includes("BLOCKER")
     })),
+    p1Hand: handRows("P1"),
+    p2Hand: handRows("P2"),
     p1Characters: charRows("P1"),
     p2Characters: charRows("P2"),
-    currentAttack: state.currentAttack,
+    p1Don: donRows("P1"),
+    p2Don: donRows("P2"),
+    p1TrashTop: trashTop("P1"),
+    p2TrashTop: trashTop("P2"),
+    legalActionsByPlayer: {
+      P1: state.legalActions.P1.map((a) => a.type),
+      P2: state.legalActions.P2.map((a) => a.type)
+    },
+    pendingPrompt: state.pendingPrompt,
+    currentAttack: state.combat.attack,
     recentEvents: state.log.slice(-8).map((event) => ({
       time: new Date(event.createdAt).toLocaleTimeString(),
       type: event.type,

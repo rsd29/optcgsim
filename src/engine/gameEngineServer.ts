@@ -1,13 +1,29 @@
-import type { CardDefinition, CardInstance, GameState, PlayerId, PlayerState } from "../game/types";
+import type { CardDefinition, CardInstance, DomainEventType, GameState, PlayerId, PlayerState } from "../game/types";
 import type { ClientRequest } from "../game/protocol";
-import { MOCK_CHARACTER_CARD_POOL } from "../game/mockCardPool";
+import { getCardCost, getCardLife } from "../game/cardCatalog";
+import { DEMO_CARD_POOL } from "../game/mockCardPool";
+import {
+  closeBlockWindow,
+  closeCounterWindowForResolution,
+  completeCombat,
+  createIdleCombatState,
+  declareAttack,
+  finalizeCombat,
+  openBlockWindow,
+  setBlockedTarget
+} from "./core/combat";
+import { createDomainEvent, resetDomainEventCounter } from "./core/domainEvents";
+import { resetEffectCounter } from "./core/effects";
+import { assertEngineInvariants } from "./core/invariants";
+import { generateLegalActions } from "./core/legalActions";
+import { expireBattleModifiers, expireTurnModifiers, getEffectivePower, getGrantedKeywords, resetModifierCounter } from "./core/modifiers";
+import { resolvePrompt, resetPromptCounter } from "./core/prompts";
+import { processRequestWithValidation } from "./core/requestProcessor";
+import { applyDomainEvent } from "./core/stateTransitions";
 
 const HAND_SIZE = 5;
-const LIFE_SIZE = 5;
 const CHARACTER_AREA_LIMIT = 5;
 const STARTING_DON = 10;
-const EVENT_LOG_LIMIT = 200;
-
 let instanceCounter = 1;
 let donCounter = 1;
 
@@ -39,31 +55,34 @@ const shuffle = <T,>(array: T[]): T[] => {
 };
 
 const buildStarterDeckDefinitions = (): CardDefinition[] => {
-  const pool = MOCK_CHARACTER_CARD_POOL;
+  const pool = DEMO_CARD_POOL.filter((card) => card.type === "CHARACTER");
   if (pool.length === 0) {
-    throw new Error("MOCK_CHARACTER_CARD_POOL is empty. Add at least one mock card.");
+    throw new Error("DEMO_CARD_POOL has no character cards. Add at least one character card.");
   }
 
   const defs: CardDefinition[] = [];
   for (let i = 0; i < 50; i += 1) {
     const source = pool[randomInt(0, pool.length - 1)]!;
-    defs.push({
-      cardId: source.cardId,
-      name: source.name,
-      type: "CHARACTER",
-      cost: source.cost,
-      power: source.power
-    });
+    defs.push({ ...source });
   }
   return defs;
 };
 
-const buildLeaderDefinition = (playerName: string): CardDefinition => ({
-  cardId: `LDR-${playerName.toUpperCase().replace(/[^A-Z0-9]/g, "")}`,
-  name: `${playerName} Leader`,
-  type: "LEADER",
-  power: 5000
-});
+const getDemoLeaderDefinition = (cardId: "L001"): CardDefinition => {
+  const leader = DEMO_CARD_POOL.find((card) => card.cardId === cardId && card.type === "LEADER");
+  if (!leader) {
+    throw new Error(`Missing required leader definition ${cardId} in DEMO_CARD_POOL.`);
+  }
+  return leader;
+};
+
+const buildCardDefinitionsCatalog = (): Record<string, CardDefinition> => {
+  const catalog: Record<string, CardDefinition> = {};
+  for (const def of DEMO_CARD_POOL) {
+    catalog[def.cardId] = def;
+  }
+  return catalog;
+};
 
 const makeCardInstance = (cardDef: CardDefinition, ownerId: PlayerId): CardInstance => ({
   instanceId: makeInstanceId("CARD"),
@@ -72,15 +91,19 @@ const makeCardInstance = (cardDef: CardDefinition, ownerId: PlayerId): CardInsta
   type: cardDef.type,
   cost: cardDef.cost,
   power: cardDef.power,
+  counter: cardDef.counter,
+  keywords: cardDef.keywords,
+  abilities: cardDef.abilities,
   ownerId,
   controllerId: ownerId,
   rested: false,
   summoningSick: false,
+  attachedDon: 0,
   faceup: true
 });
 
 const makePlayer = (id: PlayerId, name: string): PlayerState => {
-  const leader = makeCardInstance(buildLeaderDefinition(name), id);
+  const leader = makeCardInstance(getDemoLeaderDefinition("L001"), id);
   const deckDefs = buildStarterDeckDefinitions();
   const deck = deckDefs.map((def) => makeCardInstance(def, id));
   const donDeck = Array.from({ length: STARTING_DON }, () => ({ id: makeDonId(id) }));
@@ -101,7 +124,8 @@ const makePlayer = (id: PlayerId, name: string): PlayerState => {
     attachedDon: {},
     hasMulliganed: false,
     isGoingFirst: false,
-    turnsTaken: 0
+    turnsTaken: 0,
+    oncePerTurnUsage: {}
   };
 };
 
@@ -113,14 +137,21 @@ const makeInitialState = (playerAName: string, playerBName: string): GameState =
   priorityPlayerId: "P1",
   firstPlayerId: "P1",
   phase: "SETUP",
+  cardDefinitions: buildCardDefinitionsCatalog(),
   players: {
     P1: makePlayer("P1", playerAName),
     P2: makePlayer("P2", playerBName)
   },
-  currentAttack: null,
+  combat: createIdleCombatState(),
   winnerId: null,
   loserId: null,
   log: [],
+  domainEvents: [],
+  effectsQueue: [],
+  pendingSelection: null,
+  pendingPrompt: null,
+  lastingModifiers: [],
+  legalActions: { P1: [], P2: [] },
   hooks: {
     canMulligan: false,
     pendingStartOfGameEffects: false,
@@ -131,11 +162,73 @@ const makeInitialState = (playerAName: string, playerBName: string): GameState =
 const playerList = (state: GameState): PlayerState[] => [state.players.P1, state.players.P2];
 const opponentId = (playerId: PlayerId): PlayerId => (playerId === "P1" ? "P2" : "P1");
 
+const CORE_EVENT_TYPES = new Set<DomainEventType>([
+  "MATCH_CREATED",
+  "ROLL_RESULT",
+  "FIRST_PLAYER_SET",
+  "DECK_SHUFFLED",
+  "OPENING_HAND_DRAWN",
+  "MULLIGAN_KEEP_HAND",
+  "LIFE_SET",
+  "TEST_START_WITH_TEN_DON",
+  "TURN_REFRESHED",
+  "TURN_STARTED",
+  "PHASE_STARTED",
+  "CARD_DRAWN",
+  "CARD_DRAW_FAILED_EMPTY_DECK",
+  "DON_ADDED",
+  "CARD_PLAYED",
+  "CHARACTER_PLAYED",
+  "CHARACTER_REPLACED",
+  "CARD_LEFT_HAND",
+  "CARD_ENTERED_FIELD",
+  "ATTACK_DECLARED",
+  "ATTACKER_RESTED",
+  "BLOCK_WINDOW_OPENED",
+  "ATTACK_BLOCKED",
+  "BLOCK_DECLARED",
+  "BLOCK_PASSED",
+  "BATTLE_RESOLVED",
+  "CHARACTER_BATTLE_RESOLVED",
+  "ATTACK_NO_DAMAGE",
+  "CARD_KO",
+  "CHARACTER_KO",
+  "CARD_MOVED",
+  "LIFE_TAKEN",
+  "CARD_ADDED_TO_HAND_FROM_LIFE",
+  "END_TURN_REQUESTED",
+  "TURN_ENDED",
+  "GAME_WON",
+  "GAME_ENDED",
+  "PROMPT_OPENED",
+  "PROMPT_RESOLVED",
+  "EFFECT_QUEUED",
+  "EFFECT_RESOLVED"
+]);
+
 const pushLog = (state: GameState, type: string, payload?: Record<string, unknown>): void => {
-  state.log.push({ type, payload: payload ?? {}, createdAt: now() });
-  if (state.log.length > EVENT_LOG_LIMIT) {
-    state.log.shift();
+  if (CORE_EVENT_TYPES.has(type as DomainEventType)) {
+    applyDomainEvent(state, createDomainEvent(type as DomainEventType, payload as never));
+    return;
   }
+  if (type.startsWith("HOOK_")) {
+    const hookPayload = payload ? { payload } : {};
+    applyDomainEvent(
+      state,
+      createDomainEvent("HOOK", {
+        name: type,
+        ...hookPayload
+      })
+    );
+    return;
+  }
+  applyDomainEvent(
+    state,
+    createDomainEvent("LEGACY_LOGGED", {
+      originalType: type,
+      payload: payload ?? {}
+    })
+  );
 };
 
 const hook = (state: GameState, name: string, payload?: Record<string, unknown>): void => {
@@ -159,6 +252,8 @@ const guardMainPhaseForActive = (state: GameState, playerId: PlayerId): void => 
   if (state.priorityPlayerId !== playerId) throw new Error("Player does not have priority.");
 };
 
+const hasBlockerKeyword = (state: GameState, card: CardInstance): boolean => getGrantedKeywords(state, card).includes("BLOCKER");
+
 export class GameEngineServer {
   private state: GameState | null = null;
   private listeners = new Set<(state: GameState) => void>();
@@ -173,65 +268,48 @@ export class GameEngineServer {
   }
 
   processRequest(request: ClientRequest): GameState | null {
-    switch (request.type) {
-      case "GET_STATE":
-        return this.getState();
-      case "START_MATCH":
+    if (request.type === "GET_STATE") return this.getState();
+
+    const next = processRequestWithValidation(this.state, request, {
+      startMatch: (playerAName, playerBName, testStartWithTenDon) => {
         instanceCounter = 1;
         donCounter = 1;
-        this.state = makeInitialState(request.payload.playerAName, request.payload.playerBName);
-        this.setupMatch(this.state, request.payload.testStartWithTenDon === true);
-        this.runTurnStartPhases(this.state);
-        this.emitState();
-        return this.getState();
-      case "PLAY_CHARACTER":
-        this.state = this.playCharacter(
-          this.getRequiredState(),
-          request.payload.playerId,
-          request.payload.handIndex,
-          request.payload.replaceRef
-        );
-        this.emitState();
-        return this.getState();
-      case "ATTACK_LEADER":
-        this.state = this.declareAttackLeader(
-          this.getRequiredState(),
-          request.payload.playerId,
-          request.payload.attackerRef ?? "leader"
-        );
-        this.emitState();
-        return this.getState();
-      case "ATTACK_CHARACTER":
-        this.state = this.declareAttackCharacter(
-          this.getRequiredState(),
-          request.payload.playerId,
-          request.payload.attackerRef,
-          request.payload.defenderRef
-        );
-        this.emitState();
-        return this.getState();
-      case "END_TURN":
-        this.state = this.endTurn(this.getRequiredState(), request.payload.playerId);
-        this.emitState();
-        return this.getState();
-      case "AUTO_MAIN_STEP":
-        this.state = this.autoMainStep(this.getRequiredState(), request.payload.playerId);
-        this.emitState();
-        return this.getState();
-      case "AUTO_PLAY":
+        resetDomainEventCounter();
+        resetEffectCounter();
+        resetModifierCounter();
+        resetPromptCounter();
+        const nextState = makeInitialState(playerAName, playerBName);
+        this.setupMatch(nextState, testStartWithTenDon);
+        this.runTurnStartPhases(nextState);
+        return nextState;
+      },
+      playCharacter: (playerId, handIndex, replaceRef) =>
+        this.playCharacter(this.getRequiredState(), playerId, handIndex, replaceRef),
+      attackLeader: (playerId, attackerRef) => this.declareAttackLeader(this.getRequiredState(), playerId, attackerRef),
+      attackCharacter: (playerId, attackerRef, defenderRef) =>
+        this.declareAttackCharacter(this.getRequiredState(), playerId, attackerRef, defenderRef),
+      blockAttack: (playerId, blockerRef) => this.blockAttack(this.getRequiredState(), playerId, blockerRef),
+      passBlock: (playerId) => this.passBlock(this.getRequiredState(), playerId),
+      endTurn: (playerId) => this.endTurn(this.getRequiredState(), playerId),
+      autoMainStep: (playerId) => this.autoMainStep(this.getRequiredState(), playerId),
+      autoPlay: (playerId, maxSteps) => {
         this.getRequiredState();
-        for (let i = 0; i < request.payload.maxSteps; i += 1) {
+        for (let i = 0; i < maxSteps; i += 1) {
           const current = this.getRequiredState();
           if (current.status === "FINISHED") break;
-          this.state = this.autoMainStep(current, request.payload.playerId);
+          this.state = this.autoMainStep(current, playerId);
         }
-        this.emitState();
-        return this.getState();
-      default: {
-        const _never: never = request;
-        throw new Error(`Unhandled request ${(request as { type: string }).type}`);
-      }
+        return this.getRequiredState();
+      },
+      resolvePrompt: (playerId, promptId, payload) => this.resolvePromptAction(this.getRequiredState(), playerId, promptId, payload)
+    });
+    this.state = next;
+    if (this.state) {
+      this.state.legalActions = generateLegalActions(this.state);
+      assertEngineInvariants(this.state);
     }
+    this.emitState();
+    return this.getState();
   }
 
   private getRequiredState(): GameState {
@@ -272,6 +350,13 @@ export class GameEngineServer {
     }
 
     for (const player of playerList(state)) {
+      const leaderLife = player.leader.type === "LEADER" ? (getCardLife(state, player.leader) ?? 5) : 5;
+      const lifeCards = drawFromDeck(player, leaderLife);
+      player.life.push(...lifeCards);
+      pushLog(state, "LIFE_SET", { playerId: player.id, count: lifeCards.length });
+    }
+
+    for (const player of playerList(state)) {
       const opening = drawFromDeck(player, HAND_SIZE);
       player.hand.push(...opening);
       pushLog(state, "OPENING_HAND_DRAWN", { playerId: player.id, count: opening.length });
@@ -288,12 +373,6 @@ export class GameEngineServer {
     hook(state, "onStartOfGameEffects");
     state.hooks.pendingStartOfGameEffects = false;
     state.hooks.canMulligan = false;
-
-    for (const player of playerList(state)) {
-      const lifeCards = drawFromDeck(player, LIFE_SIZE);
-      player.life.push(...lifeCards);
-      pushLog(state, "LIFE_SET", { playerId: player.id, count: lifeCards.length });
-    }
 
     if (testStartWithTenDon) {
       for (const player of playerList(state)) {
@@ -312,7 +391,7 @@ export class GameEngineServer {
 
   private runTurnStartPhases(state: GameState): void {
     const active = state.players[state.activePlayerId];
-    state.currentAttack = null;
+    state.combat = createIdleCombatState();
     state.priorityPlayerId = state.activePlayerId;
 
     hook(state, "onTurnStart", { playerId: active.id, turn: state.turnNumber });
@@ -365,8 +444,9 @@ export class GameEngineServer {
   }
 
   private resolveAttackIfNeeded(state: GameState): GameState {
-    const attack = state.currentAttack;
+    const attack = state.combat.attack;
     if (!attack || attack.resolved) return state;
+    if (state.combat.status !== "DAMAGE_RESOLUTION") return state;
     const attackingPlayer = state.players[attack.attackingPlayerId];
     const attacker =
       attackingPlayer.leader.instanceId === attack.attackerId
@@ -375,11 +455,11 @@ export class GameEngineServer {
     if (!attacker) {
       throw new Error("Attack resolution failed because attacker was not found.");
     }
-    const attackerPower = attacker.power ?? 0;
+    const attackerPower = getEffectivePower(state, attacker);
 
     if (attack.target === "LEADER") {
       const defender = state.players[attack.defendingPlayerId];
-      const defenderPower = defender.leader.power ?? 0;
+      const defenderPower = getEffectivePower(state, defender.leader);
       if (attackerPower < defenderPower) {
         pushLog(state, "ATTACK_NO_DAMAGE", {
           target: "LEADER",
@@ -417,7 +497,7 @@ export class GameEngineServer {
         throw new Error("Character attack failed because defender was not found on board.");
       }
 
-      const defenderPower = defender.power ?? 0;
+      const defenderPower = getEffectivePower(state, defender);
       pushLog(state, "CHARACTER_BATTLE_RESOLVED", {
         attackerId: attacker.instanceId,
         defenderId: defender.instanceId,
@@ -439,13 +519,19 @@ export class GameEngineServer {
     }
 
     hook(state, "onDamageResolved", { attackerId: attack.attackerId });
-    attack.resolved = true;
-    state.currentAttack = null;
+    expireBattleModifiers(state);
+    state.combat = completeCombat(state.combat);
+    state.combat = finalizeCombat(state.combat);
+    state.combat = createIdleCombatState();
     return state;
   }
 
   private runSharedResolution(state: GameState): GameState {
     hook(state, "beforeActionResolve");
+    if (state.combat.status === "COUNTER_WINDOW") {
+      // Counter step is intentionally a no-op in MVP but keeps the state machine explicit.
+      state.combat = closeCounterWindowForResolution(state.combat);
+    }
     state = this.resolveAttackIfNeeded(state);
     state = this.checkWinLoss(state);
     hook(state, "afterActionResolve");
@@ -505,11 +591,11 @@ export class GameEngineServer {
     }
 
     const candidateIndex =
-      handIndex ?? player.hand.findIndex((card) => card.type === "CHARACTER" && (card.cost ?? 0) <= player.donActive.length);
+      handIndex ?? player.hand.findIndex((card) => card.type === "CHARACTER" && getCardCost(state, card) <= player.donActive.length);
     const card = player.hand[candidateIndex];
     if (!card) throw new Error("No valid card found in hand at that index.");
     if (card.type !== "CHARACTER") throw new Error("Only character cards are playable.");
-    const cardCost = card.cost ?? 0;
+    const cardCost = getCardCost(state, card);
     if (cardCost > player.donActive.length) throw new Error("Not enough active DON to play this card.");
 
     for (let i = 0; i < cardCost; i += 1) {
@@ -533,6 +619,7 @@ export class GameEngineServer {
     player.characterArea.push(card);
 
     pushLog(state, "CHARACTER_PLAYED", { playerId, card: card.name, cost: cardCost });
+    pushLog(state, "CARD_PLAYED", { playerId, cardId: card.instanceId, cardName: card.name });
     pushLog(state, "CARD_LEFT_HAND", { playerId, cardId: card.instanceId });
     pushLog(state, "CARD_ENTERED_FIELD", { playerId, cardId: card.instanceId });
     hook(state, "onCharacterPlayed", { playerId, cardId: card.instanceId });
@@ -546,6 +633,9 @@ export class GameEngineServer {
     attackerRef: "leader" | number | string = "leader"
   ): GameState {
     guardMainPhaseForActive(state, playerId);
+    if (state.combat.attack && !state.combat.attack.resolved) {
+      throw new Error("Cannot declare another attack until the current block phase/attack is resolved.");
+    }
     const player = state.players[playerId];
     const defenderId = opponentId(playerId);
     const attacker = this.resolveAttacker(player, attackerRef);
@@ -559,18 +649,20 @@ export class GameEngineServer {
     }
 
     attacker.rested = true;
-    state.currentAttack = {
+    state.combat = declareAttack(state.combat, {
       attackerId: attacker.instanceId,
       attackingPlayerId: playerId,
       defendingPlayerId: defenderId,
-      target: "LEADER",
-      resolved: false
-    };
+      target: "LEADER"
+    });
+    state.combat = openBlockWindow(state.combat);
+    state.priorityPlayerId = defenderId;
     pushLog(state, "ATTACK_DECLARED", { attackingPlayerId: playerId, defendingPlayerId: defenderId, attacker: attacker.name });
     pushLog(state, "ATTACKER_RESTED", { attackerId: attacker.instanceId });
+    pushLog(state, "BLOCK_WINDOW_OPENED", { attackingPlayerId: playerId, defendingPlayerId: defenderId });
     hook(state, "onAttackDeclared", { attackingPlayerId: playerId, attackerId: attacker.instanceId });
 
-    return this.runSharedResolution(state);
+    return state;
   }
 
   private declareAttackCharacter(
@@ -580,6 +672,9 @@ export class GameEngineServer {
     defenderRef: number | string
   ): GameState {
     guardMainPhaseForActive(state, playerId);
+    if (state.combat.attack && !state.combat.attack.resolved) {
+      throw new Error("Cannot declare another attack until the current block phase/attack is resolved.");
+    }
     const player = state.players[playerId];
     const defenderId = opponentId(playerId);
     const defenderPlayer = state.players[defenderId];
@@ -594,14 +689,15 @@ export class GameEngineServer {
     if (!defender.rested) throw new Error("Character attacks can only target rested opponent characters.");
 
     attacker.rested = true;
-    state.currentAttack = {
+    state.combat = declareAttack(state.combat, {
       attackerId: attacker.instanceId,
       attackingPlayerId: playerId,
       defendingPlayerId: defenderId,
       target: "CHARACTER",
-      defendingCharacterId: defender.instanceId,
-      resolved: false
-    };
+      defendingCharacterId: defender.instanceId
+    });
+    state.combat = openBlockWindow(state.combat);
+    state.priorityPlayerId = defenderId;
     pushLog(state, "ATTACK_DECLARED", {
       attackingPlayerId: playerId,
       defendingPlayerId: defenderId,
@@ -610,9 +706,74 @@ export class GameEngineServer {
       targetCharacter: defender.name
     });
     pushLog(state, "ATTACKER_RESTED", { attackerId: attacker.instanceId });
+    pushLog(state, "BLOCK_WINDOW_OPENED", { attackingPlayerId: playerId, defendingPlayerId: defenderId });
     hook(state, "onAttackDeclared", { attackingPlayerId: playerId, attackerId: attacker.instanceId });
 
+    return state;
+  }
+
+  private blockAttack(state: GameState, playerId: PlayerId, blockerRef: number | string): GameState {
+    if (state.status !== "IN_PROGRESS") throw new Error("Game is not in progress.");
+    if (state.phase !== "MAIN") throw new Error("Block is only allowed during MAIN phase.");
+    const attack = state.combat.attack;
+    if (!attack || attack.resolved) throw new Error("No unresolved attack to block.");
+    if (state.combat.status !== "BLOCK_WINDOW") throw new Error("Block phase is closed for this attack.");
+    if (playerId !== attack.defendingPlayerId) throw new Error("Only the defending player can block this attack.");
+    if (state.priorityPlayerId !== playerId) throw new Error("Defending player does not have priority to block.");
+
+    const defender = state.players[playerId];
+    const blocker = this.resolveCharacterOnField(defender, blockerRef);
+    if (blocker.rested) throw new Error("Blocker must be active (not rested).");
+    if (!hasBlockerKeyword(state, blocker)) throw new Error("Selected character does not have Blocker.");
+
+    state.combat = setBlockedTarget(state.combat, blocker.instanceId);
+    state.priorityPlayerId = attack.attackingPlayerId;
+
+    pushLog(state, "ATTACK_BLOCKED", {
+      defendingPlayerId: playerId,
+      blockerId: blocker.instanceId,
+      blockerName: blocker.name
+    });
+    pushLog(state, "BLOCK_DECLARED", {
+      defendingPlayerId: playerId,
+      blockerId: blocker.instanceId
+    });
+    hook(state, "onAttackBlocked", {
+      defendingPlayerId: playerId,
+      blockerId: blocker.instanceId
+    });
+
     return this.runSharedResolution(state);
+  }
+
+  private passBlock(state: GameState, playerId: PlayerId): GameState {
+    if (state.status !== "IN_PROGRESS") throw new Error("Game is not in progress.");
+    if (state.phase !== "MAIN") throw new Error("Block pass is only allowed during MAIN phase.");
+    const attack = state.combat.attack;
+    if (!attack || attack.resolved) throw new Error("No unresolved attack to resolve.");
+    if (state.combat.status !== "BLOCK_WINDOW") throw new Error("Block phase is already closed for this attack.");
+    if (playerId !== attack.defendingPlayerId) throw new Error("Only the defending player can pass block.");
+    if (state.priorityPlayerId !== playerId) throw new Error("Defending player does not have priority to pass block.");
+
+    state.combat = closeBlockWindow(state.combat);
+    state.priorityPlayerId = attack.attackingPlayerId;
+    pushLog(state, "BLOCK_PASSED", { defendingPlayerId: playerId });
+
+    return this.runSharedResolution(state);
+  }
+
+  private resolvePromptAction(
+    state: GameState,
+    playerId: PlayerId,
+    promptId: string,
+    payload: {
+      selectedCardInstanceIds?: string[];
+      selectedOptionId?: string;
+      yesNoChoice?: boolean;
+    }
+  ): GameState {
+    resolvePrompt(state, playerId, promptId, payload);
+    return state;
   }
 
   private endTurn(state: GameState, playerId: PlayerId): GameState {
@@ -621,6 +782,7 @@ export class GameEngineServer {
     state.phase = "END";
     hook(state, "onTurnEnd", { playerId, turn: state.turnNumber });
     pushLog(state, "TURN_ENDED", { playerId, turn: state.turnNumber });
+    expireTurnModifiers(state, state.turnNumber);
     state.players[playerId].turnsTaken += 1;
 
     state.activePlayerId = opponentId(playerId);
@@ -634,7 +796,7 @@ export class GameEngineServer {
   private autoMainStep(state: GameState, playerId: PlayerId): GameState {
     guardMainPhaseForActive(state, playerId);
     const player = state.players[playerId];
-    const playable = player.hand.findIndex((card) => card.type === "CHARACTER" && (card.cost ?? 0) <= player.donActive.length);
+    const playable = player.hand.findIndex((card) => card.type === "CHARACTER" && getCardCost(state, card) <= player.donActive.length);
     if (playable >= 0 && player.characterArea.length < CHARACTER_AREA_LIMIT) {
       return this.playCharacter(state, playerId, playable);
     }
