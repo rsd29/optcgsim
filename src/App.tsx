@@ -1,11 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ReactNode, SyntheticEvent } from "react";
+import type { CSSProperties, ReactNode, SyntheticEvent } from "react";
 import { createLocalGameClient } from "./client/createLocalGameClient";
 import { getFallbackCardArtUrl } from "./game/cardArtResolver";
 import type { PlayerId, ReadableSnapshot } from "./game/types";
 
 const formatSnapshot = (snapshot: ReadableSnapshot | null): string =>
   snapshot ? JSON.stringify(snapshot, null, 2) : "No match running. Click Start Match.";
+const INITIAL_CLOCK_SECONDS = 25 * 60;
+const formatClock = (totalSeconds: number): string => {
+  const safeSeconds = Math.max(0, totalSeconds);
+  const minutes = Math.floor(safeSeconds / 60);
+  const seconds = safeSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+};
 
 type RecentEvent = ReadableSnapshot["recentEvents"][number];
 
@@ -35,6 +42,15 @@ type PendingReplace = { playerId: PlayerId; handIndex: number; cardName: string 
 type AttackTarget =
   | { type: "LEADER"; playerId: PlayerId; label: string }
   | { type: "CHARACTER"; playerId: PlayerId; slot: number; label: string };
+
+type CombatPreviewCard = {
+  playerId: PlayerId;
+  name: string;
+  artUrl: string;
+  power: number | null;
+};
+
+type HandSortMode = "DEFAULT" | "COST" | "COUNTER_THEN_COST" | "TYPE_THEN_COST";
 
 const parsePayload = (payload: string): Record<string, unknown> => {
   try {
@@ -172,6 +188,11 @@ function App() {
   const [pendingReplace, setPendingReplace] = useState<PendingReplace | null>(null);
   const [selectedAttackTarget, setSelectedAttackTarget] = useState<AttackTarget | null>(null);
   const [replaceTargetSlot, setReplaceTargetSlot] = useState<number | null>(null);
+  const [p1ClockSeconds, setP1ClockSeconds] = useState<number>(INITIAL_CLOCK_SECONDS);
+  const [p2ClockSeconds, setP2ClockSeconds] = useState<number>(INITIAL_CLOCK_SECONDS);
+  const [timeoutDeclaredFor, setTimeoutDeclaredFor] = useState<PlayerId | null>(null);
+  const [p1HandSortMode, setP1HandSortMode] = useState<HandSortMode>("DEFAULT");
+  const [p2HandSortMode, setP2HandSortMode] = useState<HandSortMode>("DEFAULT");
 
   const client = useMemo(() => createLocalGameClient(), []);
 
@@ -189,6 +210,15 @@ function App() {
   }, [client]);
 
   const activePlayerId: PlayerId = snapshot?.match.activePlayerId ?? "P1";
+  const timeControlPlayerId: PlayerId = (() => {
+    if (
+      snapshot?.match.combatStatus &&
+      (snapshot.match.combatStatus === "BLOCK_WINDOW" || snapshot.match.combatStatus === "COUNTER_WINDOW")
+    ) {
+      return snapshot.currentAttack?.defendingPlayerId ?? snapshot.match.activePlayerId;
+    }
+    return snapshot?.match.activePlayerId ?? "P1";
+  })();
   const inMainPhase = Boolean(snapshot && snapshot.match.status === "IN_PROGRESS" && snapshot.match.phase === "MAIN");
 
   const run = (action: () => void) => {
@@ -220,10 +250,103 @@ function App() {
     }
   }, [snapshot]);
 
+  useEffect(() => {
+    if (!snapshot?.match.id) return;
+    setP1ClockSeconds(INITIAL_CLOCK_SECONDS);
+    setP2ClockSeconds(INITIAL_CLOCK_SECONDS);
+    setTimeoutDeclaredFor(null);
+  }, [snapshot?.match.id]);
+
+  useEffect(() => {
+    if (!snapshot || snapshot.match.status !== "IN_PROGRESS") return;
+    const tick = window.setInterval(() => {
+      if (timeControlPlayerId === "P1") {
+        setP1ClockSeconds((prev) => Math.max(0, prev - 1));
+      } else {
+        setP2ClockSeconds((prev) => Math.max(0, prev - 1));
+      }
+    }, 1000);
+    return () => window.clearInterval(tick);
+  }, [snapshot?.match.status, snapshot?.match.id, timeControlPlayerId]);
+
+  useEffect(() => {
+    if (!snapshot || snapshot.match.status !== "IN_PROGRESS") return;
+    if (timeoutDeclaredFor) return;
+    if (p1ClockSeconds <= 0) {
+      run(() => client.declareTimeoutLoss("P1"));
+      setTimeoutDeclaredFor("P1");
+      return;
+    }
+    if (p2ClockSeconds <= 0) {
+      run(() => client.declareTimeoutLoss("P2"));
+      setTimeoutDeclaredFor("P2");
+    }
+  }, [snapshot?.match.status, p1ClockSeconds, p2ClockSeconds, timeoutDeclaredFor, client]);
+
+  const canBeAttackTargetFor = (attackerPlayerId: PlayerId, targetPlayerId: PlayerId, rested?: boolean): boolean => {
+    if (attackerPlayerId === targetPlayerId) return false;
+    return rested === undefined ? true : rested;
+  };
+
   const canSelectAsAttackTarget = (playerId: PlayerId, rested?: boolean): boolean => {
     if (!pendingAttack) return false;
-    if (pendingAttack.attackerPlayerId === playerId) return false;
-    return rested === undefined ? true : rested;
+    return canBeAttackTargetFor(pendingAttack.attackerPlayerId, playerId, rested);
+  };
+
+  const handSortModeFor = (playerId: PlayerId): HandSortMode => (playerId === "P1" ? p1HandSortMode : p2HandSortMode);
+  const setHandSortModeFor = (playerId: PlayerId, mode: HandSortMode): void => {
+    if (playerId === "P1") {
+      setP1HandSortMode(mode);
+    } else {
+      setP2HandSortMode(mode);
+    }
+  };
+
+  const sortHandCards = (cards: ReadableSnapshot["p1Hand"], mode: HandSortMode): ReadableSnapshot["p1Hand"] => {
+    if (mode === "DEFAULT") return cards;
+    const copy = [...cards];
+    const safeCost = (value: number | undefined): number => (typeof value === "number" ? value : Number.MAX_SAFE_INTEGER);
+    const safeCounter = (value: number | undefined): number => (typeof value === "number" ? value : 0);
+    const typeBucket = (card: (typeof copy)[number]): number => {
+      if (safeCounter(card.counter) > 0) return 0;
+      if (card.type === "CHARACTER") return 1;
+      if (card.type === "EVENT") return 2;
+      return 3;
+    };
+
+    copy.sort((a, b) => {
+      if (mode === "COST") {
+        return safeCost(a.cost) - safeCost(b.cost) || a.name.localeCompare(b.name);
+      }
+      if (mode === "COUNTER_THEN_COST") {
+        return safeCounter(b.counter) - safeCounter(a.counter) || safeCost(a.cost) - safeCost(b.cost) || a.name.localeCompare(b.name);
+      }
+      return (
+        typeBucket(a) - typeBucket(b) ||
+        safeCost(a.cost) - safeCost(b.cost) ||
+        safeCounter(b.counter) - safeCounter(a.counter) ||
+        a.name.localeCompare(b.name)
+      );
+    });
+    return copy;
+  };
+
+  const buildPendingAttackFromEntity = (entity: SelectedEntity): PendingAttack | null => {
+    if (entity.kind === "HAND") return null;
+    if (entity.kind === "LEADER") {
+      return {
+        attackerPlayerId: entity.playerId,
+        attackerRef: "leader",
+        attackerType: "LEADER",
+        attackerName: entity.cardName
+      };
+    }
+    return {
+      attackerPlayerId: entity.playerId,
+      attackerRef: entity.slot,
+      attackerType: "CHARACTER",
+      attackerName: entity.cardName
+    };
   };
 
   const handleCardClick = (entity: SelectedEntity): void => {
@@ -242,6 +365,43 @@ function App() {
         });
         return;
       }
+    }
+
+    if (
+      !pendingAttack &&
+      selected &&
+      selected.kind !== "HAND" &&
+      canStartAttack &&
+      selected.playerId === activePlayerId &&
+      entity.kind === "LEADER" &&
+      canBeAttackTargetFor(selected.playerId, entity.playerId)
+    ) {
+      const nextPendingAttack = buildPendingAttackFromEntity(selected);
+      if (!nextPendingAttack) return;
+      setPendingAttack(nextPendingAttack);
+      setSelectedAttackTarget({ type: "LEADER", playerId: entity.playerId, label: `${entity.cardName}` });
+      return;
+    }
+
+    if (
+      !pendingAttack &&
+      selected &&
+      selected.kind !== "HAND" &&
+      canStartAttack &&
+      selected.playerId === activePlayerId &&
+      entity.kind === "CHARACTER" &&
+      canBeAttackTargetFor(selected.playerId, entity.playerId, entity.rested)
+    ) {
+      const nextPendingAttack = buildPendingAttackFromEntity(selected);
+      if (!nextPendingAttack) return;
+      setPendingAttack(nextPendingAttack);
+      setSelectedAttackTarget({
+        type: "CHARACTER",
+        playerId: entity.playerId,
+        slot: entity.slot,
+        label: `${entity.cardName} (#${entity.slot + 1})`
+      });
+      return;
     }
 
     if (pendingReplace && entity.kind === "CHARACTER" && entity.playerId === pendingReplace.playerId) {
@@ -287,6 +447,93 @@ function App() {
       !selectedCharacterLive.rested
   );
   const canPassBlock = Boolean(snapshot?.currentAttack && defendingPlayerForCurrentAttack);
+  const buildLeaderPreviewCard = (playerId: PlayerId, fallbackName?: string): CombatPreviewCard | null => {
+    const player = getPlayer(playerId);
+    if (!player) return null;
+    return {
+      playerId,
+      name: fallbackName ?? `${playerId} Leader`,
+      artUrl: player.leaderArtUrl,
+      power: player.leaderPower
+    };
+  };
+  const buildCharacterPreviewCardById = (playerId: PlayerId, cardId: string): CombatPreviewCard | null => {
+    const card = boardFor(playerId).find((entry) => entry.id === cardId);
+    if (!card) return null;
+    return {
+      playerId,
+      name: card.name,
+      artUrl: card.artUrl,
+      power: card.power ?? null
+    };
+  };
+  const buildCharacterPreviewCardBySlot = (playerId: PlayerId, slot: number): CombatPreviewCard | null => {
+    const card = boardFor(playerId).find((entry) => entry.slot === slot);
+    if (!card) return null;
+    return {
+      playerId,
+      name: card.name,
+      artUrl: card.artUrl,
+      power: card.power ?? null
+    };
+  };
+  const pendingAttackAttackerPreviewCard = (() => {
+    if (!pendingAttack) return null;
+    if (pendingAttack.attackerType === "LEADER") {
+      return buildLeaderPreviewCard(pendingAttack.attackerPlayerId, pendingAttack.attackerName);
+    }
+    if (typeof pendingAttack.attackerRef !== "number") return null;
+    return buildCharacterPreviewCardBySlot(pendingAttack.attackerPlayerId, pendingAttack.attackerRef);
+  })();
+  const selectedTargetPreviewCard = (() => {
+    if (!selectedAttackTarget) return null;
+    if (selectedAttackTarget.type === "LEADER") {
+      return buildLeaderPreviewCard(selectedAttackTarget.playerId, selectedAttackTarget.label);
+    }
+    return buildCharacterPreviewCardBySlot(selectedAttackTarget.playerId, selectedAttackTarget.slot);
+  })();
+  const liveAttackAttackerPreviewCard = (() => {
+    if (!snapshot?.currentAttack) return null;
+    const attack = snapshot.currentAttack;
+    const attackerCharacter = buildCharacterPreviewCardById(attack.attackingPlayerId, attack.attackerId);
+    if (attackerCharacter) return attackerCharacter;
+    return buildLeaderPreviewCard(attack.attackingPlayerId);
+  })();
+  const liveAttackDefenderPreviewCard = (() => {
+    if (!snapshot?.currentAttack) return null;
+    const attack = snapshot.currentAttack;
+    if (attack.defendingCharacterId) {
+      return buildCharacterPreviewCardById(attack.defendingPlayerId, attack.defendingCharacterId);
+    }
+    if (attack.target === "LEADER") {
+      return buildLeaderPreviewCard(attack.defendingPlayerId);
+    }
+    return null;
+  })();
+  const combatPreview = (() => {
+    if (snapshot?.currentAttack) {
+      return {
+        show: true,
+        attacker: liveAttackAttackerPreviewCard,
+        defender: liveAttackDefenderPreviewCard,
+        attackerPlayerId: snapshot.currentAttack.attackingPlayerId
+      };
+    }
+    if (pendingAttack) {
+      return {
+        show: true,
+        attacker: pendingAttackAttackerPreviewCard,
+        defender: selectedTargetPreviewCard,
+        attackerPlayerId: pendingAttack.attackerPlayerId
+      };
+    }
+    return {
+      show: false,
+      attacker: null,
+      defender: null,
+      attackerPlayerId: null
+    };
+  })();
   const selectedCardPreview = (() => {
     if (!snapshot || !selected) return null;
     if (selected.kind === "LEADER") {
@@ -369,13 +616,40 @@ function App() {
             selectedAttackTarget.playerId === playerId &&
             selectedAttackTarget.slot === slot;
           const isTargetable = canSelectAsAttackTarget(playerId, card.rested);
+          const isPendingAttacker =
+            Boolean(
+              pendingAttack &&
+                pendingAttack.attackerPlayerId === playerId &&
+                pendingAttack.attackerType === "CHARACTER" &&
+                typeof pendingAttack.attackerRef === "number" &&
+                pendingAttack.attackerRef === slot
+            ) && !snapshot?.currentAttack;
+          const isLiveAttacker = Boolean(
+            snapshot?.currentAttack &&
+              snapshot.currentAttack.attackingPlayerId === playerId &&
+              snapshot.currentAttack.attackerId === card.id
+          );
+          const isPendingDefender =
+            Boolean(
+              pendingAttack &&
+                selectedAttackTarget?.type === "CHARACTER" &&
+                selectedAttackTarget.playerId === playerId &&
+                selectedAttackTarget.slot === slot
+            ) && !snapshot?.currentAttack;
+          const isLiveDefender = Boolean(
+            snapshot?.currentAttack &&
+              snapshot.currentAttack.defendingPlayerId === playerId &&
+              snapshot.currentAttack.defendingCharacterId === card.id
+          );
+          const isAttacker = isPendingAttacker || isLiveAttacker;
+          const isDefender = isPendingDefender || isLiveDefender;
 
           return (
             <button
               key={card.id}
               className={`card-shell card-face field-card ${card.rested ? "card-rested" : ""} ${isSelected ? "card-selected" : ""} ${
                 isTargeted ? "card-targeted" : ""
-              } ${isTargetable ? "card-targetable" : ""}`}
+              } ${isTargetable ? "card-targetable" : ""} ${isAttacker ? "card-attacker" : ""} ${isDefender ? "card-defender" : ""}`}
               onClick={() =>
                 handleCardClick({
                   kind: "CHARACTER",
@@ -407,6 +681,32 @@ function App() {
     const leaderSelected = selected?.kind === "LEADER" && selected.playerId === playerId;
     const leaderTargeted = selectedAttackTarget?.type === "LEADER" && selectedAttackTarget.playerId === playerId;
     const leaderTargetable = canSelectAsAttackTarget(playerId);
+    const pendingLeaderAttacker =
+      Boolean(
+        pendingAttack &&
+          pendingAttack.attackerPlayerId === playerId &&
+          pendingAttack.attackerType === "LEADER" &&
+          pendingAttack.attackerRef === "leader"
+      ) && !snapshot?.currentAttack;
+    const liveLeaderAttacker = Boolean(
+      snapshot?.currentAttack &&
+        snapshot.currentAttack.attackingPlayerId === playerId &&
+        !boardFor(playerId).some((card) => card.id === snapshot.currentAttack?.attackerId)
+    );
+    const pendingLeaderDefender =
+      Boolean(
+        pendingAttack &&
+          selectedAttackTarget?.type === "LEADER" &&
+          selectedAttackTarget.playerId === playerId
+      ) && !snapshot?.currentAttack;
+    const liveLeaderDefender = Boolean(
+      snapshot?.currentAttack &&
+        snapshot.currentAttack.defendingPlayerId === playerId &&
+        snapshot.currentAttack.target === "LEADER" &&
+        !snapshot.currentAttack.defendingCharacterId
+    );
+    const leaderIsAttacker = pendingLeaderAttacker || liveLeaderAttacker;
+    const leaderIsDefender = pendingLeaderDefender || liveLeaderDefender;
 
     return (
       <section className={`field-zone ${isActive ? "field-zone-active" : ""} ${isOpponent ? "field-opponent" : "field-player"}`}>
@@ -428,7 +728,9 @@ function App() {
             <button
               className={`card-shell card-face leader-card ${leaderSelected ? "card-selected" : ""} ${
                 leaderTargeted ? "card-targeted" : ""
-              } ${leaderTargetable ? "card-targetable" : ""} ${p.leaderRested ? "card-rested" : ""}`}
+              } ${leaderTargetable ? "card-targetable" : ""} ${p.leaderRested ? "card-rested" : ""} ${
+                leaderIsAttacker ? "card-attacker" : ""
+              } ${leaderIsDefender ? "card-defender" : ""}`}
               onClick={() => handleCardClick({ kind: "LEADER", playerId, cardName: `${p.name} Leader` })}
             >
               <img src={p.leaderArtUrl} alt={`${p.name} Leader`} className="leader-card-art-full" onError={onCardArtError} />
@@ -436,7 +738,12 @@ function App() {
             {!isOpponent ? <div className="card-shell stage-zone">Stage (future)</div> : null}
           </div>
           <div className={`pile-stack deck-pile-stack ${isOpponent ? "opponent-deck-pile" : "player-deck-pile"}`}>
-            {renderFaceDownCharacterPile(p.deck, { label: "Deck", stagger: false })}
+            {renderFaceDownCharacterPile(p.deck, {
+              stagger: true,
+              maxVisible: 22,
+              staggerAxis: "y",
+              staggerOffsetPx: 1
+            })}
           </div>
         </div>
 
@@ -487,16 +794,27 @@ function App() {
   };
 
   const renderHand = (playerId: PlayerId, className = "hand-ui"): ReactNode => {
-    const player = getPlayer(playerId);
     const hand = handFor(playerId);
+    const handSortMode = handSortModeFor(playerId);
+    const sortedHand = sortHandCards(hand, handSortMode);
+    const playerLabel = playerId === "P1" ? "Player 1" : "Player 2";
+    const handCountLabel = `${hand.length} ${hand.length === 1 ? "Card" : "Cards"}`;
+    const staggerStartCount = 9;
+    const shouldStagger = sortedHand.length >= staggerStartCount;
+    const staggerOverlapPx = Math.min(44, Math.max(12, (sortedHand.length - staggerStartCount + 1) * 6));
+    const handStripStyle: CSSProperties | undefined = shouldStagger
+      ? ({ "--hand-stagger-overlap": `${staggerOverlapPx}px` } as CSSProperties)
+      : undefined;
     return (
       <section className={className}>
-        <h3>{player?.name ?? playerId} Hand</h3>
+        <h3>
+          {playerLabel} Hand ({handCountLabel})
+        </h3>
         {hand.length === 0 ? (
           <p>No cards in hand.</p>
         ) : (
-          <div className="hand-strip">
-            {hand.map((card) => {
+          <div className={`hand-strip ${shouldStagger ? "hand-strip-staggered" : ""}`} style={handStripStyle}>
+            {sortedHand.map((card) => {
               const isSelected =
                 selected?.kind === "HAND" && selected.playerId === playerId && selected.handIndex === card.handIndex;
               return (
@@ -518,6 +836,32 @@ function App() {
             })}
           </div>
         )}
+        <div className="hand-sort-controls" role="group" aria-label={`${playerLabel} hand sorting controls`}>
+          <button
+            className={handSortMode === "DEFAULT" ? "hand-sort-btn hand-sort-btn-active" : "hand-sort-btn"}
+            onClick={() => setHandSortModeFor(playerId, "DEFAULT")}
+          >
+            Default
+          </button>
+          <button
+            className={handSortMode === "COST" ? "hand-sort-btn hand-sort-btn-active" : "hand-sort-btn"}
+            onClick={() => setHandSortModeFor(playerId, "COST")}
+          >
+            Cost
+          </button>
+          <button
+            className={handSortMode === "COUNTER_THEN_COST" ? "hand-sort-btn hand-sort-btn-active" : "hand-sort-btn"}
+            onClick={() => setHandSortModeFor(playerId, "COUNTER_THEN_COST")}
+          >
+            Counter -&gt; Cost
+          </button>
+          <button
+            className={handSortMode === "TYPE_THEN_COST" ? "hand-sort-btn hand-sort-btn-active" : "hand-sort-btn"}
+            onClick={() => setHandSortModeFor(playerId, "TYPE_THEN_COST")}
+          >
+            Type -&gt; Cost
+          </button>
+        </div>
       </section>
     );
   };
@@ -530,13 +874,6 @@ function App() {
     const playerCanPlaySelectedHand = Boolean(
       playerSelected && playerSelected.kind === "HAND" && inMainPhase && activePlayerId === playerId
     );
-    const playerCanStartAttack = Boolean(
-      playerSelected &&
-        playerSelected.kind !== "HAND" &&
-        playerSelected.playerId === playerId &&
-        canStartAttack
-    );
-    const playerCanConfirmAttack = Boolean(playerPendingAttack && selectedAttackTarget && canConfirmAttack);
     const playerCanBlockWithSelected = Boolean(snapshot?.currentAttack && canBlockWithSelected && selected?.playerId === playerId);
     const playerCanPassBlock = Boolean(snapshot?.currentAttack && defendingPlayerForCurrentAttack === playerId && canPassBlock);
     const playerCanConfirmReplace = Boolean(playerPendingReplace && canConfirmReplace);
@@ -582,52 +919,7 @@ function App() {
             </button>
           ) : null}
 
-          {playerCanStartAttack ? (
-            <button
-              onClick={() => {
-                if (!playerSelected || playerSelected.kind === "HAND") return;
-                if (playerSelected.kind === "LEADER") {
-                  setPendingAttack({
-                    attackerPlayerId: playerSelected.playerId,
-                    attackerRef: "leader",
-                    attackerType: "LEADER",
-                    attackerName: playerSelected.cardName
-                  });
-                  setSelectedAttackTarget(null);
-                } else {
-                  setPendingAttack({
-                    attackerPlayerId: playerSelected.playerId,
-                    attackerRef: playerSelected.slot,
-                    attackerType: "CHARACTER",
-                    attackerName: playerSelected.cardName
-                  });
-                  setSelectedAttackTarget(null);
-                }
-              }}
-            >
-              Attack
-            </button>
-          ) : null}
-
           {playerPendingAttack ? <div className="action-hint">Select an opponent leader or rested character on the board.</div> : null}
-
-          {playerCanConfirmAttack ? (
-            <button
-              onClick={() => {
-                if (!playerPendingAttack || !selectedAttackTarget) return;
-                if (selectedAttackTarget.type === "LEADER") {
-                  run(() => client.attackLeader(playerPendingAttack.attackerPlayerId, playerPendingAttack.attackerRef));
-                } else {
-                  run(() =>
-                    client.attackCharacter(playerPendingAttack.attackerPlayerId, playerPendingAttack.attackerRef, selectedAttackTarget.slot)
-                  );
-                }
-                resetActionState();
-              }}
-            >
-              Confirm Attack
-            </button>
-          ) : null}
 
           {snapshot?.currentAttack && defendingPlayerForCurrentAttack === playerId ? (
             <div className="action-hint">
@@ -677,8 +969,6 @@ function App() {
 
           {!playerCanEndTurn &&
           !playerCanPlaySelectedHand &&
-          !playerCanStartAttack &&
-          !playerCanConfirmAttack &&
           !playerCanBlockWithSelected &&
           !playerCanPassBlock &&
           !playerCanConfirmReplace &&
@@ -689,6 +979,16 @@ function App() {
         </div>
       </aside>
     );
+  };
+
+  const handleConfirmAttack = (): void => {
+    if (!pendingAttack || !selectedAttackTarget) return;
+    if (selectedAttackTarget.type === "LEADER") {
+      run(() => client.attackLeader(pendingAttack.attackerPlayerId, pendingAttack.attackerRef));
+    } else {
+      run(() => client.attackCharacter(pendingAttack.attackerPlayerId, pendingAttack.attackerRef, selectedAttackTarget.slot));
+    }
+    resetActionState();
   };
 
   return (
@@ -753,19 +1053,45 @@ function App() {
         ) : (
           <>
             {renderHand("P2", "hand-ui hand-ui-top")}
-            <section className="board-table">
+            <section className={`board-table ${timeControlPlayerId === "P2" ? "board-table-opponent-turn" : "board-table-player-turn"}`}>
+              <div
+                className={`turn-arrow ${snapshot.match.activePlayerId === "P2" ? "turn-arrow-top turn-arrow-opponent" : "turn-arrow-bottom turn-arrow-player"}`}
+                aria-hidden="true"
+              />
               {renderField("P2", true)}
+              <div
+                className={`board-center-strip ${
+                  timeControlPlayerId === "P2" ? "board-center-strip-opponent-turn" : "board-center-strip-player-turn"
+                }`}
+              >
+                <div
+                  className={`center-clock ${timeControlPlayerId === "P1" ? "center-clock-active-player" : ""} ${
+                    p1ClockSeconds <= 300 ? "center-clock-low-time" : ""
+                  }`}
+                >
+                  P1 {formatClock(p1ClockSeconds)}
+                </div>
+                <div className="center-turn-meta">
+                  Turn <strong>{snapshot.match.turnNumber}</strong> - <strong>{snapshot.match.activePlayerId}</strong>'s turn
+                </div>
+                <div
+                  className={`center-clock ${timeControlPlayerId === "P2" ? "center-clock-active-opponent" : ""} ${
+                    p2ClockSeconds <= 300 ? "center-clock-low-time" : ""
+                  }`}
+                >
+                  P2 {formatClock(p2ClockSeconds)}
+                </div>
+              </div>
               {renderField("P1", false)}
             </section>
             {renderHand("P1", "hand-ui")}
 
-            <section className="console-window" aria-label="Game state console output">
-              <pre>{formatSnapshot(snapshot)}</pre>
-            </section>
-            <div className="turn-indicator-left">
-              Turn <strong>{snapshot.match.turnNumber}</strong> | Phase <strong>{snapshot.match.phase}</strong> | Active{" "}
-              <strong>{snapshot.match.activePlayerId}</strong>
-            </div>
+            <details className="console-disclosure">
+              <summary>Game State Console</summary>
+              <section className="console-window" aria-label="Game state console output">
+                <pre>{formatSnapshot(snapshot)}</pre>
+              </section>
+            </details>
           </>
         )}
       </section>
@@ -773,6 +1099,57 @@ function App() {
       <section className="action-panels">
         {renderActionPanel("P2", "P2 Actions", "action-panel action-panel-top")}
         {renderActionPanel("P1", "P1 Actions", "action-panel")}
+        <aside
+          className={`combat-preview-panel ${combatPreview.attackerPlayerId === "P2" ? "combat-preview-panel-top" : ""}`}
+          aria-label="Combat preview"
+        >
+          <h2>Combat Preview</h2>
+          {combatPreview.show ? (
+            <div className="combat-preview-grid">
+              <div className={`combat-preview-card ${combatPreview.attacker?.playerId === "P2" ? "combat-preview-card-top" : ""}`}>
+                <h3>Attacker</h3>
+                {combatPreview.attacker ? (
+                  <>
+                    <img
+                      src={combatPreview.attacker.artUrl}
+                      alt={combatPreview.attacker.name}
+                      className="combat-preview-art"
+                      onError={onCardArtError}
+                    />
+                    <div className="combat-preview-card-name">{combatPreview.attacker.name}</div>
+                    <div className="combat-preview-power">Power: {combatPreview.attacker.power ?? "-"}</div>
+                  </>
+                ) : (
+                  <div className="combat-preview-empty">No attacker selected.</div>
+                )}
+              </div>
+              <div className={`combat-preview-card ${combatPreview.defender?.playerId === "P2" ? "combat-preview-card-top" : ""}`}>
+                <h3>Defender</h3>
+                {combatPreview.defender ? (
+                  <>
+                    <img
+                      src={combatPreview.defender.artUrl}
+                      alt={combatPreview.defender.name}
+                      className="combat-preview-art"
+                      onError={onCardArtError}
+                    />
+                    <div className="combat-preview-card-name">{combatPreview.defender.name}</div>
+                    <div className="combat-preview-power">Power: {combatPreview.defender.power ?? "-"}</div>
+                  </>
+                ) : (
+                  <div className="combat-preview-empty">Choose a target to attack.</div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="action-hint">Start an attack to preview attacker and defender.</div>
+          )}
+          {canConfirmAttack ? (
+            <button className="combat-preview-confirm" onClick={handleConfirmAttack}>
+              Confirm Attack
+            </button>
+          ) : null}
+        </aside>
       </section>
     </main>
   );

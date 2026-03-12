@@ -28,6 +28,7 @@ export type GameClientApi = {
     payload?: { selectedCardInstanceIds?: string[]; selectedOptionId?: string; yesNoChoice?: boolean }
   ) => void;
   endTurn: (playerId: PlayerId) => void;
+  declareTimeoutLoss: (loserId: PlayerId) => void;
   autoMainStep: (playerId: PlayerId) => void;
   autoPlay: (playerId: PlayerId, maxSteps?: number) => void;
   requestState: () => void;
@@ -154,6 +155,12 @@ export const createGameClient = (
         payload: { playerId }
       });
     },
+    declareTimeoutLoss(loserId) {
+      send({
+        type: "DECLARE_TIMEOUT_LOSS",
+        payload: { loserId }
+      });
+    },
     autoMainStep(playerId) {
       send({
         type: "AUTO_MAIN_STEP",
@@ -199,6 +206,7 @@ export const createGameClient = (
       console.log("  OPTCG.passBlock('P1' | 'P2')");
       console.log("  OPTCG.resolvePrompt('P1' | 'P2', promptId, payload?)");
       console.log("  OPTCG.endTurn('P1' | 'P2')");
+      console.log("  OPTCG.declareTimeoutLoss('P1' | 'P2')");
       console.log("  OPTCG.autoMainStep('P1' | 'P2')");
       console.log("  OPTCG.autoPlay('P1' | 'P2', maxSteps?)");
       console.log("  OPTCG.requestState()");

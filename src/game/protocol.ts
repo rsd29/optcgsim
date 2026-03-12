@@ -61,6 +61,11 @@ export type ClientRequest =
       requestId: string;
       type: "GET_STATE";
       payload: Record<string, never>;
+    }
+  | {
+      requestId: string;
+      type: "DECLARE_TIMEOUT_LOSS";
+      payload: { loserId: PlayerId };
     };
 
 export type ServerMessage =

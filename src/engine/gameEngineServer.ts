@@ -291,6 +291,7 @@ export class GameEngineServer {
       blockAttack: (playerId, blockerRef) => this.blockAttack(this.getRequiredState(), playerId, blockerRef),
       passBlock: (playerId) => this.passBlock(this.getRequiredState(), playerId),
       endTurn: (playerId) => this.endTurn(this.getRequiredState(), playerId),
+      declareTimeoutLoss: (loserId) => this.declareTimeoutLoss(this.getRequiredState(), loserId),
       autoMainStep: (playerId) => this.autoMainStep(this.getRequiredState(), playerId),
       autoPlay: (playerId, maxSteps) => {
         this.getRequiredState();
@@ -440,6 +441,22 @@ export class GameEngineServer {
       state.status = "FINISHED";
     }
     hook(state, "afterLethalCheck");
+    return state;
+  }
+
+  private declareTimeoutLoss(state: GameState, loserId: PlayerId): GameState {
+    if (state.status === "FINISHED") return state;
+    const winnerId: PlayerId = loserId === "P1" ? "P2" : "P1";
+    state.winnerId = winnerId;
+    state.loserId = loserId;
+    state.status = "FINISHED";
+    state.phase = "FINISHED";
+    state.combat = createIdleCombatState();
+    pushLog(state, "GAME_WON", {
+      winnerId,
+      loserId,
+      reason: `${loserId} lost on time.`
+    });
     return state;
   }
 

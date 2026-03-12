@@ -10,6 +10,7 @@ export type RequestExecutionHandlers = {
   blockAttack: (playerId: PlayerId, blockerRef: number | string) => GameState;
   passBlock: (playerId: PlayerId) => GameState;
   endTurn: (playerId: PlayerId) => GameState;
+  declareTimeoutLoss: (loserId: PlayerId) => GameState;
   autoMainStep: (playerId: PlayerId) => GameState;
   autoPlay: (playerId: PlayerId, maxSteps: number) => GameState;
   resolvePrompt: (
@@ -62,6 +63,9 @@ export const processRequestWithValidation = (
         request.payload.playerBName,
         request.payload.testStartWithTenDon === true
       );
+    case "DECLARE_TIMEOUT_LOSS":
+      if (!state) throw new Error("No match started yet.");
+      return handlers.declareTimeoutLoss(request.payload.loserId);
     case "AUTO_MAIN_STEP":
       if (!state) throw new Error("No match started yet.");
       return handlers.autoMainStep(request.payload.playerId);
