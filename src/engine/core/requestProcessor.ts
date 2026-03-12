@@ -1,9 +1,14 @@
 import type { ClientRequest } from "../../game/protocol";
+import type { StartMatchRequestOptions } from "../../game/pregame";
 import type { GameState, LegalAction, PlayerId } from "../../game/types";
 import { generateLegalActionsForPlayer } from "./legalActions";
 
 export type RequestExecutionHandlers = {
-  startMatch: (playerAName: string, playerBName: string, testStartWithTenDon: boolean) => GameState;
+  startMatch: (
+    playerAName: string,
+    playerBName: string,
+    options: StartMatchRequestOptions & { testStartWithTenDon: boolean }
+  ) => GameState;
   playCharacter: (playerId: PlayerId, handIndex?: number, replaceRef?: number | string) => GameState;
   attackLeader: (playerId: PlayerId, attackerRef: "leader" | number | string) => GameState;
   attackCharacter: (playerId: PlayerId, attackerRef: "leader" | number | string, defenderRef: number | string) => GameState;
@@ -61,7 +66,15 @@ export const processRequestWithValidation = (
       return handlers.startMatch(
         request.payload.playerAName,
         request.payload.playerBName,
-        request.payload.testStartWithTenDon === true
+        {
+          testStartWithTenDon: request.payload.testStartWithTenDon === true,
+          ...(request.payload.firstPlayerId ? { firstPlayerId: request.payload.firstPlayerId } : {}),
+          ...(typeof request.payload.p1Roll === "number" ? { p1Roll: request.payload.p1Roll } : {}),
+          ...(typeof request.payload.p2Roll === "number" ? { p2Roll: request.payload.p2Roll } : {}),
+          ...(typeof request.payload.initialClockSeconds === "number"
+            ? { initialClockSeconds: request.payload.initialClockSeconds }
+            : {})
+        }
       );
     case "DECLARE_TIMEOUT_LOSS":
       if (!state) throw new Error("No match started yet.");

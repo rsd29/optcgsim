@@ -1,12 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, SyntheticEvent } from "react";
 import { createLocalGameClient } from "./client/createLocalGameClient";
 import { getFallbackCardArtUrl } from "./game/cardArtResolver";
+import { DEFAULT_PLAYER_CLOCK_SECONDS, LOW_TIME_WARNING_SECONDS, getTimeControlPlayerId } from "./game/timeControl";
 import type { PlayerId, ReadableSnapshot } from "./game/types";
 
 const formatSnapshot = (snapshot: ReadableSnapshot | null): string =>
   snapshot ? JSON.stringify(snapshot, null, 2) : "No match running. Click Start Match.";
-const INITIAL_CLOCK_SECONDS = 25 * 60;
 const formatClock = (totalSeconds: number): string => {
   const safeSeconds = Math.max(0, totalSeconds);
   const minutes = Math.floor(safeSeconds / 60);
@@ -51,6 +51,15 @@ type CombatPreviewCard = {
 };
 
 type HandSortMode = "DEFAULT" | "COST" | "COUNTER_THEN_COST" | "TYPE_THEN_COST";
+type PreGamePhase = "IDLE" | "READY" | "ROLLING" | "CHOOSING";
+type PreGameReelState = {
+  current: number;
+  next: number;
+  animating: boolean;
+  stepKey: number;
+  stepDurationMs: number;
+};
+type StartMode = "ROLL_FLOW" | "DEBUG_P1_FIRST";
 
 const parsePayload = (payload: string): Record<string, unknown> => {
   try {
@@ -67,6 +76,13 @@ const onCardArtError = (event: SyntheticEvent<HTMLImageElement>): void => {
   img.dataset.fallbackApplied = "true";
   img.src = getFallbackCardArtUrl();
 };
+const createInitialReelState = (): PreGameReelState => ({
+  current: 1,
+  next: 1,
+  animating: false,
+  stepKey: 0,
+  stepDurationMs: 120
+});
 
 const humanEvent = (event: RecentEvent): ReactNode => {
   const payload = parsePayload(event.payload);
@@ -188,11 +204,20 @@ function App() {
   const [pendingReplace, setPendingReplace] = useState<PendingReplace | null>(null);
   const [selectedAttackTarget, setSelectedAttackTarget] = useState<AttackTarget | null>(null);
   const [replaceTargetSlot, setReplaceTargetSlot] = useState<number | null>(null);
-  const [p1ClockSeconds, setP1ClockSeconds] = useState<number>(INITIAL_CLOCK_SECONDS);
-  const [p2ClockSeconds, setP2ClockSeconds] = useState<number>(INITIAL_CLOCK_SECONDS);
+  const [p1ClockSeconds, setP1ClockSeconds] = useState<number>(DEFAULT_PLAYER_CLOCK_SECONDS);
+  const [p2ClockSeconds, setP2ClockSeconds] = useState<number>(DEFAULT_PLAYER_CLOCK_SECONDS);
   const [timeoutDeclaredFor, setTimeoutDeclaredFor] = useState<PlayerId | null>(null);
   const [p1HandSortMode, setP1HandSortMode] = useState<HandSortMode>("DEFAULT");
   const [p2HandSortMode, setP2HandSortMode] = useState<HandSortMode>("DEFAULT");
+  const [hoveredDeckPlayerId, setHoveredDeckPlayerId] = useState<PlayerId | null>(null);
+  const [pendingStartMode, setPendingStartMode] = useState<StartMode | null>(null);
+  const [preGamePhase, setPreGamePhase] = useState<PreGamePhase>("IDLE");
+  const [p1Reel, setP1Reel] = useState<PreGameReelState>(createInitialReelState);
+  const [p2Reel, setP2Reel] = useState<PreGameReelState>(createInitialReelState);
+  const [preGameFinalRolls, setPreGameFinalRolls] = useState<{ P1: number; P2: number } | null>(null);
+  const [preGameWinner, setPreGameWinner] = useState<PlayerId | null>(null);
+  const preGameTimerIdsRef = useRef<number[]>([]);
+  const preGameAnimationTokenRef = useRef<number>(0);
 
   const client = useMemo(() => createLocalGameClient(), []);
 
@@ -210,15 +235,7 @@ function App() {
   }, [client]);
 
   const activePlayerId: PlayerId = snapshot?.match.activePlayerId ?? "P1";
-  const timeControlPlayerId: PlayerId = (() => {
-    if (
-      snapshot?.match.combatStatus &&
-      (snapshot.match.combatStatus === "BLOCK_WINDOW" || snapshot.match.combatStatus === "COUNTER_WINDOW")
-    ) {
-      return snapshot.currentAttack?.defendingPlayerId ?? snapshot.match.activePlayerId;
-    }
-    return snapshot?.match.activePlayerId ?? "P1";
-  })();
+  const timeControlPlayerId: PlayerId = getTimeControlPlayerId(snapshot);
   const inMainPhase = Boolean(snapshot && snapshot.match.status === "IN_PROGRESS" && snapshot.match.phase === "MAIN");
 
   const run = (action: () => void) => {
@@ -252,10 +269,19 @@ function App() {
 
   useEffect(() => {
     if (!snapshot?.match.id) return;
-    setP1ClockSeconds(INITIAL_CLOCK_SECONDS);
-    setP2ClockSeconds(INITIAL_CLOCK_SECONDS);
+    setP1ClockSeconds(DEFAULT_PLAYER_CLOCK_SECONDS);
+    setP2ClockSeconds(DEFAULT_PLAYER_CLOCK_SECONDS);
     setTimeoutDeclaredFor(null);
   }, [snapshot?.match.id]);
+
+  useEffect(() => {
+    return () => {
+      for (const timerId of preGameTimerIdsRef.current) {
+        window.clearTimeout(timerId);
+      }
+      preGameTimerIdsRef.current = [];
+    };
+  }, []);
 
   useEffect(() => {
     if (!snapshot || snapshot.match.status !== "IN_PROGRESS") return;
@@ -329,6 +355,173 @@ function App() {
       );
     });
     return copy;
+  };
+
+  const clearPreGameTimers = (): void => {
+    for (const timerId of preGameTimerIdsRef.current) {
+      window.clearTimeout(timerId);
+    }
+    preGameTimerIdsRef.current = [];
+  };
+
+  const randomRoll = (): number => Math.floor(Math.random() * 12) + 1;
+
+  const waitPreGame = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      const id = window.setTimeout(resolve, ms);
+      preGameTimerIdsRef.current.push(id);
+    });
+
+  const animateReelToTarget = async (
+    playerId: PlayerId,
+    from: number,
+    target: number,
+    token: number
+  ): Promise<void> => {
+    const setReel = playerId === "P1" ? setP1Reel : setP2Reel;
+    const cycleCount = 1 + Math.floor(Math.random() * 2);
+    const stepsToTarget = ((target - from + 12) % 12) || 12;
+    const totalSteps = cycleCount * 12 + stepsToTarget;
+    const fastMs = 50 + Math.floor(Math.random() * 12);
+    const slowdownSteps = Math.min(6, Math.max(4, totalSteps - 1));
+    const fastPhaseSteps = Math.max(0, totalSteps - slowdownSteps);
+    const slowEndMs = 230 + Math.floor(Math.random() * 40);
+    let current = from;
+
+    for (let step = 0; step < totalSteps; step += 1) {
+      if (preGameAnimationTokenRef.current !== token) return;
+      const next = (current % 12) + 1;
+      let stepDurationMs = fastMs;
+      if (step >= fastPhaseSteps) {
+        // Only slow down in the final handful of steps, near target.
+        const slowStepIndex = step - fastPhaseSteps;
+        const slowProgress = slowdownSteps <= 1 ? 1 : slowStepIndex / (slowdownSteps - 1);
+        const easedSlow = Math.pow(slowProgress, 2.2);
+        stepDurationMs = Math.round(fastMs + (slowEndMs - fastMs) * easedSlow);
+      }
+
+      setReel((prev) => ({
+        current,
+        next,
+        animating: true,
+        stepKey: prev.stepKey + 1,
+        stepDurationMs
+      }));
+      await waitPreGame(stepDurationMs);
+      if (preGameAnimationTokenRef.current !== token) return;
+      current = next;
+      setReel((prev) => ({
+        ...prev,
+        current,
+        next: current,
+        animating: false
+      }));
+      await waitPreGame(10);
+    }
+  };
+
+  const startPreGameRoll = async (): Promise<void> => {
+    clearPreGameTimers();
+    preGameAnimationTokenRef.current += 1;
+    const token = preGameAnimationTokenRef.current;
+    let p1 = randomRoll();
+    let p2 = randomRoll();
+    while (p1 === p2) {
+      p2 = randomRoll();
+    }
+    setPreGameFinalRolls({ P1: p1, P2: p2 });
+    setPreGameWinner(p1 > p2 ? "P1" : "P2");
+    setPreGamePhase("ROLLING");
+    const p1Start = p1Reel.current;
+    const p2Start = p2Reel.current;
+    await Promise.all([animateReelToTarget("P1", p1Start, p1, token), animateReelToTarget("P2", p2Start, p2, token)]);
+    if (preGameAnimationTokenRef.current !== token) return;
+    setP1Reel((prev) => ({ ...prev, current: p1, next: p1, animating: false }));
+    setP2Reel((prev) => ({ ...prev, current: p2, next: p2, animating: false }));
+    clearPreGameTimers();
+    setPreGamePhase("CHOOSING");
+  };
+
+  const resetUiForNewMatch = (): void => {
+    clearPreGameTimers();
+    preGameAnimationTokenRef.current += 1;
+    setSnapshot(null);
+    setError("");
+    setSelected(null);
+    setPendingAttack(null);
+    setPendingReplace(null);
+    setSelectedAttackTarget(null);
+    setReplaceTargetSlot(null);
+    setHoveredDeckPlayerId(null);
+    setTimeoutDeclaredFor(null);
+    setP1ClockSeconds(DEFAULT_PLAYER_CLOCK_SECONDS);
+    setP2ClockSeconds(DEFAULT_PLAYER_CLOCK_SECONDS);
+    setP1HandSortMode("DEFAULT");
+    setP2HandSortMode("DEFAULT");
+    setPreGameWinner(null);
+    setPreGameFinalRolls(null);
+    setPreGamePhase("IDLE");
+    setP1Reel(createInitialReelState());
+    setP2Reel(createInitialReelState());
+  };
+
+  const beginStartMode = (mode: StartMode): void => {
+    const matchIsInProgress = Boolean(snapshot && snapshot.match.status === "IN_PROGRESS");
+    if (matchIsInProgress) {
+      setPendingStartMode(mode);
+      return;
+    }
+    resetUiForNewMatch();
+    if (mode === "ROLL_FLOW") {
+      setPreGamePhase("READY");
+      return;
+    }
+    run(() =>
+      client.startMatch("Luffy", "Kaido", {
+        testStartWithTenDon,
+        firstPlayerId: "P1",
+        initialClockSeconds: DEFAULT_PLAYER_CLOCK_SECONDS
+      })
+    );
+  };
+
+  const handlePreGameChoice = (winnerChoosesFirst: boolean): void => {
+    if (!preGameFinalRolls || !preGameWinner) return;
+    clearPreGameTimers();
+    preGameAnimationTokenRef.current += 1;
+    const firstPlayerId: PlayerId = winnerChoosesFirst ? preGameWinner : preGameWinner === "P1" ? "P2" : "P1";
+    setPreGamePhase("IDLE");
+    run(() =>
+      client.startMatch("Luffy", "Kaido", {
+        testStartWithTenDon,
+        firstPlayerId,
+        p1Roll: preGameFinalRolls.P1,
+        p2Roll: preGameFinalRolls.P2,
+        initialClockSeconds: DEFAULT_PLAYER_CLOCK_SECONDS
+      })
+    );
+  };
+
+  const startDebugMatchP1First = (): void => {
+    beginStartMode("DEBUG_P1_FIRST");
+  };
+
+  const confirmQuitAndStart = (): void => {
+    if (!pendingStartMode) return;
+    const nextMode = pendingStartMode;
+    setPendingStartMode(null);
+    resetUiForNewMatch();
+    if (nextMode === "ROLL_FLOW") {
+      setPreGamePhase("READY");
+      return;
+    }
+    run(() =>
+      client.startMatch("Luffy", "Kaido", {
+        testStartWithTenDon,
+        firstPlayerId: "P1",
+        initialClockSeconds: DEFAULT_PLAYER_CLOCK_SECONDS
+      })
+    );
   };
 
   const buildPendingAttackFromEntity = (entity: SelectedEntity): PendingAttack | null => {
@@ -534,22 +727,6 @@ function App() {
       attackerPlayerId: null
     };
   })();
-  const selectedCardPreview = (() => {
-    if (!snapshot || !selected) return null;
-    if (selected.kind === "LEADER") {
-      const player = getPlayer(selected.playerId);
-      if (!player) return null;
-      return { name: selected.cardName, artUrl: player.leaderArtUrl };
-    }
-    if (selected.kind === "HAND") {
-      const card = handFor(selected.playerId).find((entry) => entry.handIndex === selected.handIndex);
-      if (!card) return null;
-      return { name: selected.cardName, artUrl: card.artUrl };
-    }
-    const card = boardFor(selected.playerId).find((entry) => entry.slot === selected.slot);
-    if (!card) return null;
-    return { name: selected.cardName, artUrl: card.artUrl };
-  })();
   const renderFaceDownCharacterPile = (
     count: number,
     options?: {
@@ -604,7 +781,13 @@ function App() {
           if (!card) {
             return (
               <div key={`${playerId}-empty-${slot}`} className="card-shell card-empty">
-                <div className="empty-slot-label">Slot {slot + 1}</div>
+                <img
+                  src="/card-art/character-slot-jolly-roger.png"
+                  alt={`Character slot ${slot + 1}`}
+                  className="empty-slot-symbol"
+                  onError={onCardArtError}
+                />
+                <div className="empty-slot-number">{slot + 1}</div>
               </div>
             );
           }
@@ -708,19 +891,26 @@ function App() {
     const leaderIsAttacker = pendingLeaderAttacker || liveLeaderAttacker;
     const leaderIsDefender = pendingLeaderDefender || liveLeaderDefender;
 
+    const lifePileNode = (
+      <div className="pile-stack life-pile-layout">
+        {renderFaceDownCharacterPile(p.life, {
+          maxVisible: 5,
+          stagger: true,
+          staggerOffsetPx: 28,
+          staggerAxis: "x",
+          staggerDirection: isOpponent ? -1 : 1,
+          nextCardOnTop: false
+        })}
+      </div>
+    );
+
     return (
       <section className={`field-zone ${isActive ? "field-zone-active" : ""} ${isOpponent ? "field-opponent" : "field-player"}`}>
-        <div className="pile-stack life-pile-overlay">
-          {renderFaceDownCharacterPile(p.life, {
-            maxVisible: 5,
-            stagger: true,
-            staggerOffsetPx: 28,
-            staggerAxis: "x",
-            staggerDirection: isOpponent ? -1 : 1,
-            nextCardOnTop: false
-          })}
+        <div className="field-row field-row-top">
+          <div className="life-pile-slot life-pile-slot-left">{isOpponent ? null : lifePileNode}</div>
+          {renderCharacterRow(playerId)}
+          <div className="life-pile-slot life-pile-slot-right">{isOpponent ? lifePileNode : null}</div>
         </div>
-        <div className="field-row field-row-top">{renderCharacterRow(playerId)}</div>
 
         <div className="field-row field-row-middle">
           <div className="center-lane-pair">
@@ -737,7 +927,13 @@ function App() {
             </button>
             {!isOpponent ? <div className="card-shell stage-zone">Stage (future)</div> : null}
           </div>
-          <div className={`pile-stack deck-pile-stack ${isOpponent ? "opponent-deck-pile" : "player-deck-pile"}`}>
+          <div
+            className={`pile-stack deck-pile-stack ${isOpponent ? "opponent-deck-pile" : "player-deck-pile"} ${
+              hoveredDeckPlayerId === playerId ? "deck-count-visible" : ""
+            }`}
+            onMouseEnter={() => setHoveredDeckPlayerId(playerId)}
+            onMouseLeave={() => setHoveredDeckPlayerId((prev) => (prev === playerId ? null : prev))}
+          >
             {renderFaceDownCharacterPile(p.deck, {
               stagger: true,
               maxVisible: 22,
@@ -749,20 +945,24 @@ function App() {
 
         <div className="field-row field-row-bottom">
           <div className="pile-stack">
-            <div className="card-shell pile-card don-deck-pile">
-              {Array.from({ length: visibleDonDeckCards }, (_, i) => (
-                <img
-                  key={`${playerId}-don-deck-${i}`}
-                  src="/card-art/don-deck-back.png"
-                  alt="DON deck back"
-                  className="don-deck-back-card"
-                  style={{
-                    transform: `translateX(${isOpponent ? -i * 6 : i * 6}px)`,
-                    zIndex: visibleDonDeckCards - i
-                  }}
-                  onError={onCardArtError}
-                />
-              ))}
+            <div className={`card-shell pile-card don-deck-pile ${p.donDeck === 0 ? "don-deck-pile-empty" : ""}`}>
+              {p.donDeck > 0 ? (
+                Array.from({ length: visibleDonDeckCards }, (_, i) => (
+                  <img
+                    key={`${playerId}-don-deck-${i}`}
+                    src="/card-art/don-deck-back.png"
+                    alt="DON deck back"
+                    className="don-deck-back-card"
+                    style={{
+                      transform: `translateX(${isOpponent ? -i * 6 : i * 6}px)`,
+                      zIndex: visibleDonDeckCards - i
+                    }}
+                    onError={onCardArtError}
+                  />
+                ))
+              ) : (
+                <img src="/card-art/don-empty-symbol.png" alt="No DON cards remaining" className="don-deck-empty-symbol" onError={onCardArtError} />
+              )}
               <div className="don-deck-count-badge">{p.donDeck}</div>
             </div>
           </div>
@@ -992,40 +1192,7 @@ function App() {
   };
 
   return (
-    <main className="page page-layout">
-      <section className="left-sidebar">
-        {showEventLog ? (
-          <aside className="event-log-panel" aria-label="Human readable action log">
-            <h2>What Just Happened</h2>
-            {!snapshot ? (
-              <p>No actions yet.</p>
-            ) : (
-              <div className="event-list">
-                {[...snapshot.recentEvents].reverse().map((event, idx) => (
-                  <div key={`${event.time}-${event.type}-${idx}`} className="event-item">
-                    <span className="event-time">{event.time}</span>
-                    <span className="event-text">{humanEvent(event)}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </aside>
-        ) : null}
-        <aside className="selected-card-panel" aria-label="Selected card preview">
-          <h2>Selected Card</h2>
-          {selectedCardPreview ? (
-            <img
-              src={selectedCardPreview.artUrl}
-              alt={selectedCardPreview.name}
-              className="selected-card-preview-img"
-              onError={onCardArtError}
-            />
-          ) : (
-            <p>Select a card to preview its art.</p>
-          )}
-        </aside>
-      </section>
-
+    <main className="page page-layout page-layout-no-left-sidebar">
       <section className="main-content">
         <h1>OPTCG Shell Console (React + TypeScript)</h1>
         <div className="controls">
@@ -1037,12 +1204,77 @@ function App() {
             />
             <span>Testing: start both players with 10 DON</span>
           </label>
-          <button onClick={() => run(() => client.startMatch("Luffy", "Kaido", { testStartWithTenDon }))}>Start Match</button>
+          <button onClick={() => beginStartMode("ROLL_FLOW")}>Start Match</button>
+          <button onClick={startDebugMatchP1First}>Debug Start Match (P1 First)</button>
           <button onClick={() => run(() => client.print())}>Print To Console</button>
           <button onClick={() => setShowEventLog((prev) => !prev)}>
             {showEventLog ? "Hide What Just Happened" : "Show What Just Happened"}
           </button>
         </div>
+
+        {preGamePhase !== "IDLE" ? (
+          <section className="pregame-roll-panel" aria-label="Pre-game roll and turn choice">
+            <div className="pregame-roll-split">
+              <div
+                className={`pregame-roll-side pregame-roll-side-p1 ${
+                  preGamePhase === "CHOOSING" ? (preGameWinner === "P1" ? "pregame-roll-side-winner" : "pregame-roll-side-loser") : ""
+                }`}
+              >
+                <h3>Player 1</h3>
+                <div className={`pregame-roll-spinner ${preGamePhase === "ROLLING" ? "pregame-roll-spinner-rolling" : ""}`}>
+                  <div className={`pregame-roll-ring ${preGamePhase === "ROLLING" ? "pregame-roll-ring-rolling" : ""}`} />
+                  <div className="pregame-roll-window" style={{ "--reel-step-ms": `${p1Reel.stepDurationMs}ms` } as CSSProperties}>
+                    <div className={`pregame-roll-number ${p1Reel.animating ? "pregame-roll-number-exit-down" : ""}`} key={`p1-cur-${p1Reel.stepKey}`}>
+                      {p1Reel.current}
+                    </div>
+                    {p1Reel.animating ? (
+                      <div className="pregame-roll-number pregame-roll-number-enter-from-top" key={`p1-next-${p1Reel.stepKey}`}>
+                        {p1Reel.next}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+                <div className={`pregame-choice-slot ${preGamePhase === "CHOOSING" && preGameWinner === "P1" ? "pregame-choice-slot-active" : ""}`}>
+                  <div className="pregame-choice-actions">
+                    <button onClick={() => handlePreGameChoice(true)}>Go First</button>
+                    <button onClick={() => handlePreGameChoice(false)}>Go Second</button>
+                  </div>
+                </div>
+              </div>
+              <div
+                className={`pregame-roll-side pregame-roll-side-p2 ${
+                  preGamePhase === "CHOOSING" ? (preGameWinner === "P2" ? "pregame-roll-side-winner" : "pregame-roll-side-loser") : ""
+                }`}
+              >
+                <h3>Player 2</h3>
+                <div className={`pregame-roll-spinner ${preGamePhase === "ROLLING" ? "pregame-roll-spinner-rolling" : ""}`}>
+                  <div className={`pregame-roll-ring ${preGamePhase === "ROLLING" ? "pregame-roll-ring-rolling" : ""}`} />
+                  <div className="pregame-roll-window" style={{ "--reel-step-ms": `${p2Reel.stepDurationMs}ms` } as CSSProperties}>
+                    <div className={`pregame-roll-number ${p2Reel.animating ? "pregame-roll-number-exit-down" : ""}`} key={`p2-cur-${p2Reel.stepKey}`}>
+                      {p2Reel.current}
+                    </div>
+                    {p2Reel.animating ? (
+                      <div className="pregame-roll-number pregame-roll-number-enter-from-top" key={`p2-next-${p2Reel.stepKey}`}>
+                        {p2Reel.next}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+                <div className={`pregame-choice-slot ${preGamePhase === "CHOOSING" && preGameWinner === "P2" ? "pregame-choice-slot-active" : ""}`}>
+                  <div className="pregame-choice-actions">
+                    <button onClick={() => handlePreGameChoice(true)}>Go First</button>
+                    <button onClick={() => handlePreGameChoice(false)}>Go Second</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="pregame-roll-meta">
+              {preGamePhase === "READY" ? <button onClick={startPreGameRoll}>Start Roll</button> : null}
+              {preGamePhase === "ROLLING" ? "Rolling 1-12..." : null}
+              {preGamePhase === "CHOOSING" && preGameWinner ? `${preGameWinner} wins the roll. Choose turn order.` : null}
+            </div>
+          </section>
+        ) : null}
 
         {error ? <p className="error">Error: {error}</p> : null}
 
@@ -1066,7 +1298,7 @@ function App() {
               >
                 <div
                   className={`center-clock ${timeControlPlayerId === "P1" ? "center-clock-active-player" : ""} ${
-                    p1ClockSeconds <= 300 ? "center-clock-low-time" : ""
+                    p1ClockSeconds <= LOW_TIME_WARNING_SECONDS ? "center-clock-low-time" : ""
                   }`}
                 >
                   P1 {formatClock(p1ClockSeconds)}
@@ -1076,7 +1308,7 @@ function App() {
                 </div>
                 <div
                   className={`center-clock ${timeControlPlayerId === "P2" ? "center-clock-active-opponent" : ""} ${
-                    p2ClockSeconds <= 300 ? "center-clock-low-time" : ""
+                    p2ClockSeconds <= LOW_TIME_WARNING_SECONDS ? "center-clock-low-time" : ""
                   }`}
                 >
                   P2 {formatClock(p2ClockSeconds)}
@@ -1097,6 +1329,23 @@ function App() {
       </section>
 
       <section className="action-panels">
+        {showEventLog ? (
+          <aside className="event-log-panel" aria-label="Human readable action log">
+            <h2>What Just Happened</h2>
+            {!snapshot ? (
+              <p>No actions yet.</p>
+            ) : (
+              <div className="event-list">
+                {[...snapshot.recentEvents].reverse().map((event, idx) => (
+                  <div key={`${event.time}-${event.type}-${idx}`} className="event-item">
+                    <span className="event-time">{event.time}</span>
+                    <span className="event-text">{humanEvent(event)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </aside>
+        ) : null}
         {renderActionPanel("P2", "P2 Actions", "action-panel action-panel-top")}
         {renderActionPanel("P1", "P1 Actions", "action-panel")}
         <aside
@@ -1151,6 +1400,18 @@ function App() {
           ) : null}
         </aside>
       </section>
+      {pendingStartMode ? (
+        <div className="match-restart-modal-backdrop" role="presentation">
+          <section className="match-restart-modal" role="dialog" aria-modal="true" aria-label="Confirm match restart">
+            <h2>Quit Match?</h2>
+            <p>Starting a new match will end the current one immediately.</p>
+            <div className="match-restart-modal-actions">
+              <button onClick={() => setPendingStartMode(null)}>Cancel</button>
+              <button onClick={confirmQuitAndStart}>Quit Match</button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }

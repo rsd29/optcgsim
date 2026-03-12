@@ -1,10 +1,11 @@
 import type { GameState, PlayerId } from "./types";
+import type { StartMatchRequestOptions } from "./pregame";
 
 export type ClientRequest =
   | {
       requestId: string;
       type: "START_MATCH";
-      payload: { playerAName: string; playerBName: string; testStartWithTenDon?: boolean };
+      payload: { playerAName: string; playerBName: string } & StartMatchRequestOptions;
     }
   | {
       requestId: string;

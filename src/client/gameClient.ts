@@ -1,4 +1,5 @@
 import type { ClientRequest, ServerMessage } from "../game/protocol";
+import type { StartMatchRequestOptions } from "../game/pregame";
 import type { GameState, PlayerId, ReadableSnapshot } from "../game/types";
 import { printSnapshotToConsole, toReadableSnapshot } from "../game/snapshot";
 import type { LocalSocketEndpoint } from "../network/localWebSocket";
@@ -15,7 +16,7 @@ export type GameClientApi = {
   startMatch: (
     playerAName?: string,
     playerBName?: string,
-    options?: { testStartWithTenDon?: boolean | undefined }
+    options?: StartMatchRequestOptions
   ) => void;
   playCharacter: (playerId: PlayerId, handIndex?: number, replaceRef?: number | string) => void;
   attackLeader: (playerId: PlayerId, attackerRef?: "leader" | number | string) => void;
@@ -95,13 +96,11 @@ export const createGameClient = (
       unsubscribeSocket = null;
     },
     startMatch(playerAName = "Player A", playerBName = "Player B", options) {
-      const payload: { playerAName: string; playerBName: string; testStartWithTenDon?: boolean } = {
+      const payload: { playerAName: string; playerBName: string } & StartMatchRequestOptions = {
         playerAName,
-        playerBName
+        playerBName,
+        ...(options ?? {})
       };
-      if (options?.testStartWithTenDon !== undefined) {
-        payload.testStartWithTenDon = options.testStartWithTenDon;
-      }
       send({
         type: "START_MATCH",
         payload

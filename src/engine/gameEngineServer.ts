@@ -1,5 +1,6 @@
 import type { CardDefinition, CardInstance, DomainEventType, GameState, PlayerId, PlayerState } from "../game/types";
 import type { ClientRequest } from "../game/protocol";
+import type { StartMatchRequestOptions } from "../game/pregame";
 import { getCardCost, getCardLife } from "../game/cardCatalog";
 import { DEMO_CARD_POOL } from "../game/mockCardPool";
 import {
@@ -271,7 +272,7 @@ export class GameEngineServer {
     if (request.type === "GET_STATE") return this.getState();
 
     const next = processRequestWithValidation(this.state, request, {
-      startMatch: (playerAName, playerBName, testStartWithTenDon) => {
+      startMatch: (playerAName, playerBName, options) => {
         instanceCounter = 1;
         donCounter = 1;
         resetDomainEventCounter();
@@ -279,7 +280,7 @@ export class GameEngineServer {
         resetModifierCounter();
         resetPromptCounter();
         const nextState = makeInitialState(playerAName, playerBName);
-        this.setupMatch(nextState, testStartWithTenDon);
+        this.setupMatch(nextState, options);
         this.runTurnStartPhases(nextState);
         return nextState;
       },
@@ -324,19 +325,33 @@ export class GameEngineServer {
     this.listeners.forEach((listener) => listener(frozen));
   }
 
-  private setupMatch(state: GameState, testStartWithTenDon: boolean): void {
+  private setupMatch(
+    state: GameState,
+    options: StartMatchRequestOptions & { testStartWithTenDon: boolean }
+  ): void {
     state.status = "SETUP";
     pushLog(state, "MATCH_CREATED", { id: state.id });
 
     const p1 = state.players.P1;
     const p2 = state.players.P2;
-    do {
-      p1.roll = randomInt(1, 6);
-      p2.roll = randomInt(1, 6);
+    const hasProvidedRolls = typeof options.p1Roll === "number" && typeof options.p2Roll === "number";
+    if (hasProvidedRolls) {
+      p1.roll = Math.max(1, Math.min(12, Math.floor(options.p1Roll ?? 1)));
+      p2.roll = Math.max(1, Math.min(12, Math.floor(options.p2Roll ?? 1)));
+      if (p1.roll === p2.roll) {
+        throw new Error("Provided pre-game rolls cannot be tied.");
+      }
       pushLog(state, "ROLL_RESULT", { P1: p1.roll, P2: p2.roll });
-    } while (p1.roll === p2.roll);
+    } else {
+      do {
+        p1.roll = randomInt(1, 6);
+        p2.roll = randomInt(1, 6);
+        pushLog(state, "ROLL_RESULT", { P1: p1.roll, P2: p2.roll });
+      } while (p1.roll === p2.roll);
+    }
 
-    const first = (p1.roll ?? 0) > (p2.roll ?? 0) ? p1 : p2;
+    const defaultFirst = (p1.roll ?? 0) > (p2.roll ?? 0) ? p1 : p2;
+    const first = options.firstPlayerId ? state.players[options.firstPlayerId] : defaultFirst;
     const second = first.id === "P1" ? p2 : p1;
     first.isGoingFirst = true;
     second.isGoingFirst = false;
@@ -375,7 +390,7 @@ export class GameEngineServer {
     state.hooks.pendingStartOfGameEffects = false;
     state.hooks.canMulligan = false;
 
-    if (testStartWithTenDon) {
+    if (options.testStartWithTenDon) {
       for (const player of playerList(state)) {
         player.donActive.push(...player.donDeck);
         player.donDeck = [];
@@ -413,12 +428,15 @@ export class GameEngineServer {
 
     state.phase = "DRAW";
     hook(state, "onDrawPhaseStart", { playerId: active.id });
-    const drawn = drawFromDeck(active, 1);
-    if (drawn.length > 0) {
-      active.hand.push(drawn[0] as CardInstance);
-      pushLog(state, "CARD_DRAWN", { playerId: active.id, card: drawn[0]?.name });
-    } else {
-      pushLog(state, "CARD_DRAW_FAILED_EMPTY_DECK", { playerId: active.id });
+    const skipFirstTurnDraw = active.id === state.firstPlayerId && active.turnsTaken === 0;
+    if (!skipFirstTurnDraw) {
+      const drawn = drawFromDeck(active, 1);
+      if (drawn.length > 0) {
+        active.hand.push(drawn[0] as CardInstance);
+        pushLog(state, "CARD_DRAWN", { playerId: active.id, card: drawn[0]?.name });
+      } else {
+        pushLog(state, "CARD_DRAW_FAILED_EMPTY_DECK", { playerId: active.id });
+      }
     }
 
     state.phase = "DON";
